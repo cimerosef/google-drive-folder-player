@@ -12,6 +12,22 @@ All notable changes to this project will be documented here.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
 
+## [0.0.9] - 2026-09-13
+
+### Changed
+
+- Keep the working 0.0.8 transition logic, but remove several conservative fixed waits that made first-track startup and next-track switching feel slow.
+- Cache preview-open state once per folder scan instead of recomputing preview evidence for every candidate DOM node. This removes an expensive repeated full-page scan inside the folder-discovery loop.
+- Reduce the post-close settle delay from a fixed 350 ms to an adaptive short wait, then let live-row resolution poll only as needed.
+- Avoid `scrollIntoView()` and its follow-up delay when the target row is already comfortably inside the viewport.
+- Shorten row-resolution and preview-confirmation polling intervals while preserving fallback retries for slower Drive transitions.
+- Add scan and transition timing diagnostics so Edge tests can compare latency directly in milliseconds.
+
+### Findings
+
+- Edge + Violentmonkey on 0.0.8 successfully transitioned manually through tracks 1 -> 2 -> 3 -> 4 -> 5.
+- The reliable 0.0.8 path was noticeably slower than earlier probes. The main avoidable costs were repeated preview-state scans during folder discovery plus fixed delays added during stabilization work.
+
 ## [0.0.8] - 2026-09-13
 
 ### Changed

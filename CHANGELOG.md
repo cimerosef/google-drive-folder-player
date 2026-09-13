@@ -6,11 +6,27 @@ All notable changes to this project will be documented here.
 
 ### Planned
 
-- Validate automatic next-track playback on Edge + Violentmonkey.
+- Validate repeated next-track transitions and automatic next-track playback on Edge + Violentmonkey.
 - Expand folder discovery beyond currently cached/rendered rows.
 - Add shuffle.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
+
+## [0.0.6] - 2026-09-13
+
+### Changed
+
+- Reacquire the target Drive row from the live DOM after every preview close instead of trusting cached row elements from the initial scan.
+- Reacquire the row again after `scrollIntoView`, because Drive virtualization can replace rows during scrolling.
+- Preserve the previous playlist index when a transition fails, so another `Next now` retries the same track instead of silently skipping ahead.
+- Retry one failed preview-open attempt with a freshly resolved row.
+- Capture a Drive row identifier (`data-id` / `data-target`) when available and prefer it over filename matching.
+- Add a short settle delay after closing the preview so Drive has time to rebuild the folder list.
+
+### Findings
+
+- Edge + Violentmonkey successfully transitioned from track 1 to track 2 in 0.0.5.
+- Subsequent transitions failed with `Drive preview did not open`, while the script had already advanced its internal index. This strongly suggests cached Drive row elements become stale or are replaced after preview transitions / virtualization.
 
 ## [0.0.5] - 2026-09-13
 

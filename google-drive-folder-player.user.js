@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
-// @description  Probe Google Drive's current folder for audio files and test opening one with Drive's own preview.
+// @version      0.0.2
+// @description  Probe Google Drive audio folders, Drive preview playback, and end-of-track events.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.1';
+  const VERSION = '0.0.2';
   const PANEL_ID = 'gdfp-probe-panel';
   const AUDIO_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -25,6 +25,8 @@
   );
 
   let detectedItems = [];
+  let activeMedia = null;
+  const observedMedia = new WeakSet();
 
   function log(...args) {
     console.log('[GDFP Probe]', ...args);
@@ -126,7 +128,7 @@
 
   function collectMediaElements(doc = document, depth = 0) {
     const media = [...doc.querySelectorAll('audio, video')];
-    if (depth >= 1) return media;
+    if (depth >= 2) return media;
 
     for (const frame of doc.querySelectorAll('iframe')) {
       try {
@@ -138,7 +140,86 @@
       }
     }
 
-    return media;
+    return [...new Set(media)];
+  }
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '?';
+    const rounded = Math.floor(seconds);
+    const mins = Math.floor(rounded / 60);
+    const secs = String(rounded % 60).padStart(2, '0');
+    return `${mins}:${secs}`;
+  }
+
+  function describeMedia(media) {
+    if (!media) return 'No HTML audio/video element detected.';
+    return `${media.tagName.toLowerCase()} | ${media.paused ? 'paused' : 'playing'} | ${formatTime(media.currentTime)} / ${formatTime(media.duration)} | ended=${media.ended}`;
+  }
+
+  function updateMediaStatus(prefix = '') {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="media-status"]`);
+    if (!box) return;
+    box.textContent = `${prefix}${prefix ? ' — ' : ''}${describeMedia(activeMedia)}`;
+
+    const seek = document.querySelector(`#${PANEL_ID} [data-gdfp="seek-end"]`);
+    if (seek) {
+      seek.disabled = !(activeMedia && Number.isFinite(activeMedia.duration) && activeMedia.duration > 4);
+      seek.style.opacity = seek.disabled ? '0.45' : '1';
+    }
+  }
+
+  function attachMediaDiagnostics(media) {
+    activeMedia = media;
+    if (observedMedia.has(media)) {
+      updateMediaStatus('Media detected');
+      return;
+    }
+
+    observedMedia.add(media);
+    log('Attaching media diagnostics:', media);
+
+    const refresh = event => {
+      activeMedia = media;
+      updateMediaStatus(event.type);
+      log(`Media event: ${event.type}`, {
+        paused: media.paused,
+        ended: media.ended,
+        currentTime: media.currentTime,
+        duration: media.duration,
+        readyState: media.readyState
+      });
+    };
+
+    for (const type of ['loadedmetadata', 'durationchange', 'play', 'pause', 'ended', 'error']) {
+      media.addEventListener(type, refresh, true);
+    }
+
+    media.addEventListener('timeupdate', () => {
+      if (activeMedia === media) updateMediaStatus('timeupdate');
+    }, true);
+
+    updateMediaStatus('Media detected');
+  }
+
+  async function probePlayer(timeoutMs = 8000) {
+    setMediaStatus('Looking for Google Drive HTML audio/video element…');
+    const started = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+      const media = collectMediaElements();
+      if (media.length) {
+        const candidate = media.find(el => !el.paused || el.currentTime > 0) || media[0];
+        attachMediaDiagnostics(candidate);
+        setStatus(`Player probe succeeded: ${media.length} HTML media element(s) detected.`);
+        return candidate;
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    activeMedia = null;
+    setMediaStatus('No HTML audio/video element detected after 8 seconds. The Drive preview can still be controlled through another DOM/UI route.');
+    setStatus('Drive preview may be open, but no directly accessible HTML media element was found.');
+    return null;
   }
 
   async function testFirstAudio() {
@@ -151,30 +232,35 @@
     }
 
     setStatus(`Opening: ${first.name}`);
+    setMediaStatus('Waiting for Drive preview…');
     log('Testing Drive open action for:', first.name, first.root);
     dispatchDoubleClick(first.root);
 
-    await new Promise(resolve => setTimeout(resolve, 1800));
-    const media = collectMediaElements();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await probePlayer(8000);
+  }
 
-    if (media.length) {
-      const summary = media.map(el => ({
-        tag: el.tagName,
-        paused: el.paused,
-        ended: el.ended,
-        duration: Number.isFinite(el.duration) ? el.duration : null,
-        currentTime: el.currentTime
-      }));
-      log('Media element(s) detected after open:', summary);
-      setStatus(`Drive preview opened; ${media.length} HTML media element(s) detected. This is a strong positive result.`);
-    } else {
-      setStatus('Open action sent. Check whether Drive preview opened. No top-level HTML audio/video element was detected yet.');
+  function seekNearEnd() {
+    if (!activeMedia || !Number.isFinite(activeMedia.duration) || activeMedia.duration <= 4) {
+      setMediaStatus('Cannot seek: no media with a known duration is currently available.');
+      return;
     }
+
+    const target = Math.max(0, activeMedia.duration - 3);
+    activeMedia.currentTime = target;
+    activeMedia.play().catch(error => log('play() after seek was rejected:', error));
+    updateMediaStatus('Seeked to final 3 seconds');
+    setStatus('End-event test armed. Wait a few seconds and watch the player probe line for “ended”.');
   }
 
   function setStatus(text) {
     const status = document.querySelector(`#${PANEL_ID} [data-gdfp="status"]`);
     if (status) status.textContent = text;
+  }
+
+  function setMediaStatus(text) {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="media-status"]`);
+    if (box) box.textContent = text;
   }
 
   function renderResults() {
@@ -214,10 +300,11 @@
     setStatus('Scan finished. If the filenames look correct, test opening the first audio file.');
   }
 
-  function createButton(label, onClick) {
+  function createButton(label, onClick, dataKey = '') {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = label;
+    if (dataKey) button.dataset.gdfp = dataKey;
     Object.assign(button.style, {
       border: '1px solid rgba(255,255,255,.28)',
       borderRadius: '7px',
@@ -241,8 +328,8 @@
       right: '18px',
       bottom: '18px',
       zIndex: '2147483647',
-      width: '320px',
-      maxHeight: '55vh',
+      width: '340px',
+      maxHeight: '62vh',
       overflow: 'auto',
       boxSizing: 'border-box',
       padding: '12px',
@@ -251,6 +338,17 @@
       color: '#f1f3f4',
       boxShadow: '0 8px 30px rgba(0,0,0,.32)',
       font: '13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+    });
+
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      position: 'sticky',
+      top: '-12px',
+      zIndex: '2',
+      margin: '-12px -12px 9px',
+      padding: '12px',
+      background: 'rgba(32, 33, 36, .985)',
+      borderBottom: '1px solid rgba(255,255,255,.12)'
     });
 
     const title = document.createElement('div');
@@ -267,13 +365,33 @@
     Object.assign(controls.style, {
       display: 'flex',
       gap: '7px',
-      flexWrap: 'wrap',
-      marginBottom: '9px'
+      flexWrap: 'wrap'
     });
+
+    const seekButton = createButton('Skip to last 3s', seekNearEnd, 'seek-end');
+    seekButton.disabled = true;
+    seekButton.style.opacity = '0.45';
+
     controls.append(
       createButton('Scan', scanCurrentView),
-      createButton('Test first audio', testFirstAudio)
+      createButton('Test first audio', testFirstAudio),
+      createButton('Probe player', () => probePlayer(8000)),
+      seekButton
     );
+
+    header.append(title, status, controls);
+
+    const mediaBox = document.createElement('div');
+    mediaBox.dataset.gdfp = 'media-status';
+    mediaBox.textContent = 'Player probe: not run yet.';
+    Object.assign(mediaBox.style, {
+      marginBottom: '9px',
+      padding: '8px',
+      borderRadius: '7px',
+      background: 'rgba(138,180,248,.12)',
+      border: '1px solid rgba(138,180,248,.28)',
+      overflowWrap: 'anywhere'
+    });
 
     const count = document.createElement('div');
     count.dataset.gdfp = 'count';
@@ -290,7 +408,7 @@
     });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe only: it currently sees items rendered in the Drive page, not the entire virtualized folder.';
+    note.textContent = 'Probe only: folder scanning currently sees rendered Drive items. Version 0.0.2 also tests whether Drive exposes a controllable HTML media element and a native ended event.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',
@@ -299,7 +417,7 @@
       fontSize: '11px'
     });
 
-    panel.append(title, status, controls, count, list, note);
+    panel.append(header, mediaBox, count, list, note);
     document.body.appendChild(panel);
     log(`Probe ${VERSION} mounted.`, location.href);
   }

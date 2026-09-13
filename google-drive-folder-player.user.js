@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.3
-// @description  Probe Google Drive audio folders and inspect Drive's native preview controls without privileged APIs.
+// @version      0.0.4
+// @description  Prototype continuous audio playback in a Google Drive folder using Drive's native preview UI.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.3';
+  const VERSION = '0.0.4';
   const PANEL_ID = 'gdfp-probe-panel';
   const AUDIO_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -25,6 +25,13 @@
   );
 
   let detectedItems = [];
+  let playlist = [];
+  let currentIndex = -1;
+  let autoMode = false;
+  let advancing = false;
+  let endArmed = false;
+  let monitorTimer = null;
+  let lastRatio = null;
 
   function log(...args) {
     console.log('[GDFP Probe]', ...args);
@@ -92,7 +99,6 @@
 
     if (dialogs.length) return dialogs;
 
-    // Google occasionally renders preview controls without role="dialog".
     const sliders = [...document.querySelectorAll('[role="slider"], input[type="range"]')]
       .filter(element => !isInsideOurPanel(element) && isVisible(element));
 
@@ -152,15 +158,15 @@
       renderResults();
       setStatus(
         previewIsOpen()
-          ? `Scan found ${results.length} folder item(s) while Drive preview is open. You can close the preview or test again.`
-          : 'Scan finished. If the filenames look correct, test opening the first audio file.'
+          ? `Scan found ${results.length} folder item(s) while Drive preview is open.`
+          : 'Scan finished. You can now start the continuous playback test.'
       );
       return results;
     }
 
     renderResults();
     if (previewIsOpen()) {
-      setStatus('Drive preview is open and no folder rows were found. Close the preview with Esc, then press Scan. The previous scan is kept.');
+      setStatus('Drive preview is open and no folder rows were found. Close the preview with Esc, then scan again. The previous scan is kept.');
     } else {
       setStatus('Scan finished. No visible audio file detected. Scroll the Drive folder so audio rows are rendered, then scan again.');
     }
@@ -190,7 +196,14 @@
 
   function dispatchEscape() {
     const target = document.activeElement || document.body || document.documentElement;
-    const options = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    const options = {
+      key: 'Escape',
+      code: 'Escape',
+      keyCode: 27,
+      which: 27,
+      bubbles: true,
+      cancelable: true
+    };
     target.dispatchEvent(new KeyboardEvent('keydown', options));
     target.dispatchEvent(new KeyboardEvent('keyup', options));
   }
@@ -198,65 +211,182 @@
   async function closePreviewIfNeeded() {
     if (!previewIsOpen()) return true;
 
-    setStatus('A Drive preview is already open. Trying to close it before the test…');
     dispatchEscape();
-
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 10; i += 1) {
       await sleep(150);
       if (!previewIsOpen()) return true;
     }
 
-    setStatus('Drive preview is still open. Close it manually with Esc or the × button, then press Scan and test again.');
+    setStatus('Drive preview is still open. Close it manually with Esc or ×, then try again.');
     return false;
   }
 
   function findCurrentItemByName(name) {
     const lower = name.toLowerCase();
-    if (detectedItems.length) {
-      const live = detectedItems.find(item => item.name.toLowerCase() === lower && item.root?.isConnected && isVisible(item.root));
-      if (live) return live;
-    }
 
-    scanCurrentView();
-    return detectedItems.find(item => item.name.toLowerCase() === lower && item.root?.isConnected) || null;
+    const cached = detectedItems.find(
+      item => item.name.toLowerCase() === lower && item.root?.isConnected
+    );
+    if (cached) return cached;
+
+    if (!previewIsOpen()) scanCurrentView();
+    return detectedItems.find(
+      item => item.name.toLowerCase() === lower && item.root?.isConnected
+    ) || null;
   }
 
-  async function testFirstAudio() {
+  async function waitForPreview(timeoutMs = 5000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (previewIsOpen()) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+
+  async function openPlaylistIndex(index, reason = 'manual') {
+    if (!playlist.length || advancing) return false;
+    if (index < 0 || index >= playlist.length) return false;
+
+    advancing = true;
+    endArmed = false;
+    lastRatio = null;
+
+    try {
+      if (!(await closePreviewIfNeeded())) return false;
+
+      const target = playlist[index];
+      const live = findCurrentItemByName(target.name);
+      if (!live?.root?.isConnected) {
+        setStatus(`Could not find the cached Drive row for: ${target.name}`);
+        return false;
+      }
+
+      currentIndex = index;
+      renderPlaybackState(`Opening (${reason})`);
+      log(`Opening playlist item ${index + 1}/${playlist.length}:`, target.name);
+      dispatchDoubleClick(live.root);
+
+      if (!(await waitForPreview())) {
+        setStatus(`Drive preview did not open for: ${target.name}`);
+        return false;
+      }
+
+      setStatus(`Playing ${currentIndex + 1}/${playlist.length}: ${target.name}`);
+      renderPlaybackState('Waiting for progress');
+      startMonitor();
+      return true;
+    } finally {
+      advancing = false;
+    }
+  }
+
+  async function startContinuousTest() {
     if (!detectedItems.length) scanCurrentView();
-
-    const original = detectedItems[0];
-    if (!original) {
-      setStatus('No folder audio item is available. Close any preview, then press Scan first.');
+    if (!detectedItems.length) {
+      setStatus('No audio rows cached. Close preview, press Scan, then retry.');
       return;
     }
 
-    if (!(await closePreviewIfNeeded())) return;
+    autoMode = true;
+    playlist = detectedItems.map(item => ({ name: item.name }));
+    currentIndex = -1;
+    endArmed = false;
+    lastRatio = null;
+    setStatus(`Continuous test armed with ${playlist.length} cached audio item(s).`);
+    await openPlaylistIndex(0, 'start');
+  }
 
-    const first = findCurrentItemByName(original.name) || detectedItems[0];
-    if (!first?.root?.isConnected) {
-      setStatus('The first scanned row is no longer available. Press Scan again, then retry.');
+  function stopContinuousTest() {
+    autoMode = false;
+    endArmed = false;
+    lastRatio = null;
+    if (monitorTimer) {
+      clearInterval(monitorTimer);
+      monitorTimer = null;
+    }
+    setStatus('Continuous test stopped. Drive playback itself was left untouched.');
+    renderPlaybackState('Stopped');
+  }
+
+  async function nextNow() {
+    if (!playlist.length) {
+      playlist = detectedItems.map(item => ({ name: item.name }));
+    }
+    if (!playlist.length) {
+      setStatus('No cached audio items. Scan the folder first.');
       return;
     }
 
-    setStatus(`Opening with Drive preview: ${first.name}`);
-    setUiStatus('Waiting for Drive preview controls…');
-    log('Testing Drive open action for:', first.name, first.root);
-    dispatchDoubleClick(first.root);
-
-    await sleep(1200);
-    if (previewIsOpen()) {
-      setStatus('Drive preview opened. Now probe its native UI controls.');
-      probePreviewUi();
-    } else {
-      setStatus('The double-click was sent, but a Drive preview was not detected. Try the test once more after a fresh Scan.');
-      setUiStatus('Preview not detected yet.');
+    autoMode = true;
+    const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+    if (nextIndex >= playlist.length) {
+      setStatus('Reached the end of the cached test playlist.');
+      stopContinuousTest();
+      return;
     }
+
+    await openPlaylistIndex(nextIndex, 'Next now');
   }
 
   function compactText(value, max = 72) {
     const text = String(value || '').replace(/\s+/g, ' ').trim();
     if (!text) return '';
     return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  }
+
+  function getPreviewControls() {
+    const root = getPreviewRoots()[0];
+    if (!root) return { root: null, controls: [], sliders: [] };
+
+    const controls = [...root.querySelectorAll(
+      'button, [role="button"], [role="slider"], [role="progressbar"], input[type="range"], [aria-valuenow]'
+    )].filter(element => isVisible(element) && !isInsideOurPanel(element));
+
+    const sliders = controls.filter(element => {
+      const now = Number(element.getAttribute('aria-valuenow'));
+      const min = Number(element.getAttribute('aria-valuemin'));
+      const max = Number(element.getAttribute('aria-valuemax'));
+      return Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min;
+    });
+
+    return { root, controls, sliders };
+  }
+
+  function findProgressSlider() {
+    const { sliders } = getPreviewControls();
+    if (!sliders.length) return null;
+
+    const scored = sliders
+      .map(element => {
+        const min = Number(element.getAttribute('aria-valuemin'));
+        const max = Number(element.getAttribute('aria-valuemax'));
+        const span = max - min;
+        const rect = element.getBoundingClientRect();
+        return { element, span, width: rect.width };
+      })
+      .sort((a, b) => {
+        const aProgressish = a.span > 100 ? 1 : 0;
+        const bProgressish = b.span > 100 ? 1 : 0;
+        if (aProgressish !== bProgressish) return bProgressish - aProgressish;
+        if (a.span !== b.span) return b.span - a.span;
+        return b.width - a.width;
+      });
+
+    return scored[0]?.element || null;
+  }
+
+  function getProgressState() {
+    const slider = findProgressSlider();
+    if (!slider) return null;
+
+    const now = Number(slider.getAttribute('aria-valuenow'));
+    const min = Number(slider.getAttribute('aria-valuemin'));
+    const max = Number(slider.getAttribute('aria-valuemax'));
+    if (![now, min, max].every(Number.isFinite) || max <= min) return null;
+
+    const ratio = Math.max(0, Math.min(1, (now - min) / (max - min)));
+    return { slider, now, min, max, ratio };
   }
 
   function describeControl(element) {
@@ -268,49 +398,88 @@
     const valueNow = element.getAttribute('aria-valuenow');
     const valueMin = element.getAttribute('aria-valuemin');
     const valueMax = element.getAttribute('aria-valuemax');
-    const valueText = compactText(element.getAttribute('aria-valuetext'));
 
     const parts = [`<${tag}>`];
     if (role) parts.push(`role=${role}`);
     if (label) parts.push(`label="${label}"`);
     else if (title) parts.push(`title="${title}"`);
     else if (text) parts.push(`text="${text}"`);
-    if (valueNow !== null) parts.push(`value=${valueNow}${valueMin !== null && valueMax !== null ? ` [${valueMin}..${valueMax}]` : ''}`);
-    if (valueText) parts.push(`valueText="${valueText}"`);
+    if (valueNow !== null) {
+      parts.push(`value=${valueNow}${valueMin !== null && valueMax !== null ? ` [${valueMin}..${valueMax}]` : ''}`);
+    }
     return parts.join(' | ');
   }
 
   function probePreviewUi() {
-    const roots = getPreviewRoots();
-    const root = roots[0];
+    const { root, controls } = getPreviewControls();
 
     if (!root) {
-      setUiStatus('No Drive preview root detected. Open an audio preview first, then press “Probe preview UI”.');
+      setUiStatus('No Drive preview root detected. Open an audio preview first.');
       setStatus('Preview UI probe could not find an open Drive preview.');
       return [];
     }
 
-    const selectors = [
-      'button', '[role="button"]', '[role="slider"]', '[role="progressbar"]',
-      'input[type="range"]', '[aria-valuenow]'
-    ].join(', ');
-
-    const controls = [...root.querySelectorAll(selectors)]
-      .filter(element => isVisible(element) && !isInsideOurPanel(element));
-
     const descriptions = [...new Set(controls.map(describeControl))].slice(0, 18);
+    renderUiResults(descriptions);
 
-    // Also capture visible time-like labels (e.g. 0:00 / 3:42), which may be plain spans.
-    const timeTexts = [...root.querySelectorAll('span, div')]
-      .filter(element => isVisible(element) && !element.children.length)
-      .map(element => compactText(element.textContent, 30))
-      .filter(text => /^(?:\d{1,2}:)?\d{1,2}:\d{2}$|^\d{1,2}:\d{2}$/.test(text))
-      .slice(0, 6);
+    const progress = getProgressState();
+    if (progress) {
+      setStatus(`Preview UI probe found ${controls.length} controls. Progress slider: ${Math.round(progress.ratio * 100)}%.`);
+    } else {
+      setStatus(`Preview UI probe found ${controls.length} controls, but no progress slider was identified.`);
+    }
 
-    renderUiResults(descriptions, timeTexts);
-    setStatus(`Preview UI probe found ${controls.length} visible control candidate(s).`);
-    log('Preview UI controls:', controls, descriptions, 'time labels:', timeTexts);
+    log('Preview UI controls:', controls, descriptions);
     return controls;
+  }
+
+  async function handleTrackEnd() {
+    if (!autoMode || advancing || currentIndex < 0) return;
+
+    endArmed = false;
+    const finished = playlist[currentIndex];
+    setStatus(`End detected: ${finished?.name || `track ${currentIndex + 1}`}`);
+
+    const nextIndex = currentIndex + 1;
+    if (nextIndex >= playlist.length) {
+      autoMode = false;
+      setStatus(`Cached playlist finished (${playlist.length} track(s)). Repeat is not enabled in this prototype yet.`);
+      renderPlaybackState('Playlist finished');
+      return;
+    }
+
+    await openPlaylistIndex(nextIndex, 'automatic next');
+  }
+
+  function monitorTick() {
+    if (!autoMode || advancing || !previewIsOpen()) return;
+
+    const progress = getProgressState();
+    if (!progress) {
+      renderPlaybackState('No progress slider');
+      return;
+    }
+
+    const ratio = progress.ratio;
+
+    if (!endArmed && ratio < 0.95) {
+      endArmed = true;
+    }
+
+    const percent = Math.round(ratio * 1000) / 10;
+    renderPlaybackState(`${percent}%${endArmed ? ' · armed' : ' · waiting reset'}`);
+
+    if (endArmed && ratio >= 0.995 && (lastRatio === null || lastRatio < 0.995)) {
+      log('Track end inferred from Drive progress slider.', progress);
+      void handleTrackEnd();
+    }
+
+    lastRatio = ratio;
+  }
+
+  function startMonitor() {
+    if (monitorTimer) return;
+    monitorTimer = setInterval(monitorTick, 250);
   }
 
   function setStatus(text) {
@@ -323,7 +492,21 @@
     if (box) box.textContent = text;
   }
 
-  function renderUiResults(descriptions = [], timeTexts = []) {
+  function renderPlaybackState(detail = '') {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="playback-status"]`);
+    if (!box) return;
+
+    const name = currentIndex >= 0 && playlist[currentIndex]
+      ? playlist[currentIndex].name
+      : '—';
+    const position = currentIndex >= 0 && playlist.length
+      ? `${currentIndex + 1}/${playlist.length}`
+      : '—';
+
+    box.textContent = `Continuous: ${autoMode ? 'ON' : 'OFF'} | Track: ${position} | ${detail}\n${name}`;
+  }
+
+  function renderUiResults(descriptions = []) {
     const box = document.querySelector(`#${PANEL_ID} [data-gdfp="ui-status"]`);
     if (!box) return;
 
@@ -344,13 +527,6 @@
       line.style.fontSize = '11px';
       line.style.marginTop = '2px';
       line.style.overflowWrap = 'anywhere';
-      box.appendChild(line);
-    }
-
-    if (timeTexts.length) {
-      const line = document.createElement('div');
-      line.textContent = `Time text: ${[...new Set(timeTexts)].join(' · ')}`;
-      line.style.marginTop = '5px';
       box.appendChild(line);
     }
   }
@@ -416,8 +592,8 @@
       right: '18px',
       bottom: '18px',
       zIndex: '2147483647',
-      width: '370px',
-      maxHeight: '72vh',
+      width: '390px',
+      maxHeight: '76vh',
       overflow: 'auto',
       boxSizing: 'border-box',
       padding: '12px',
@@ -435,7 +611,7 @@
 
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Close any Drive preview, open a music folder, then press Scan.';
+    status.textContent = 'Ready. Close preview, scan the music folder, then start the continuous test.';
     status.style.marginBottom = '9px';
 
     const controls = document.createElement('div');
@@ -447,13 +623,28 @@
     });
     controls.append(
       createButton('Scan folder view', scanCurrentView),
-      createButton('Test first audio', testFirstAudio),
+      createButton('Start continuous test', startContinuousTest),
+      createButton('Next now', nextNow),
+      createButton('Stop', stopContinuousTest),
       createButton('Probe preview UI', probePreviewUi)
     );
 
+    const playbackBox = document.createElement('div');
+    playbackBox.dataset.gdfp = 'playback-status';
+    playbackBox.textContent = 'Continuous: OFF | Track: —';
+    Object.assign(playbackBox.style, {
+      marginBottom: '9px',
+      padding: '8px',
+      borderRadius: '7px',
+      whiteSpace: 'pre-wrap',
+      background: 'rgba(129,201,149,.12)',
+      border: '1px solid rgba(129,201,149,.28)',
+      overflowWrap: 'anywhere'
+    });
+
     const uiBox = document.createElement('div');
     uiBox.dataset.gdfp = 'ui-status';
-    uiBox.textContent = 'Preview UI probe: not run yet.';
+    uiBox.textContent = 'Preview UI probe: optional diagnostic.';
     Object.assign(uiBox.style, {
       marginBottom: '9px',
       padding: '8px',
@@ -478,7 +669,7 @@
     });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.3 separates folder rows from the open preview and inspects Drive’s own visible controls. It still uses @grant none and no Google API.';
+    note.textContent = 'Probe 0.0.4 infers track end from Drive’s native progress slider and tries to open the next cached audio row automatically. Repeat and shuffle are not enabled yet.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',
@@ -487,7 +678,7 @@
       fontSize: '11px'
     });
 
-    panel.append(title, status, controls, uiBox, count, list, note);
+    panel.append(title, status, controls, playbackBox, uiBox, count, list, note);
     document.body.appendChild(panel);
     log(`Probe ${VERSION} mounted.`, location.href);
   }

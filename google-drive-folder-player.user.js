@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.7
-// @description  Prototype continuous Google Drive media playback with preview-title based transition detection.
+// @version      0.0.8
+// @description  Prototype continuous Google Drive media playback with robust folder-row discovery and preview-title transition detection.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.7';
+  const VERSION = '0.0.8';
   const PANEL_ID = 'gdfp-probe-panel';
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -75,6 +75,22 @@
     return String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
+  function findItemRoot(element) {
+    let node = element;
+    let fallback = element;
+
+    for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+      if (!(node instanceof Element) || isInsidePanel(node)) break;
+
+      const role = node.getAttribute('role');
+      if (role === 'row' || role === 'listitem') return node;
+      if (role === 'gridcell' || role === 'rowheader') fallback = node;
+      if (node.hasAttribute('data-id') || node.hasAttribute('data-target')) fallback = node;
+    }
+
+    return fallback;
+  }
+
   function getItemId(root) {
     if (!(root instanceof Element)) return '';
     const direct = root.getAttribute('data-id') || root.getAttribute('data-target');
@@ -84,20 +100,42 @@
   }
 
   function collectFolderRows() {
-    const roots = [...document.querySelectorAll('[role="row"], [role="listitem"], [role="gridcell"]')]
-      .filter(root => isVisible(root) && !isInsidePanel(root));
+    // Drive does not consistently put the filename on the row itself. In the
+    // working 0.0.6 layout it was often on a descendant span/aria-label, so
+    // scan broadly for filename-bearing descendants and climb to the row.
+    const candidates = document.querySelectorAll(
+      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
+    );
 
-    const seen = new Set();
+    const seenRoots = new Set();
+    const seenKeys = new Set();
     const results = [];
-    for (const root of roots) {
-      const name = extractMediaName(root);
+
+    for (const element of candidates) {
+      if (isInsidePanel(element)) continue;
+
+      const name = extractMediaName(element);
       if (!name) continue;
+
+      // When a preview is open, ignore media-looking text in its top chrome.
+      const rect = element.getBoundingClientRect();
+      if (getPreviewEvidenceFast().open && rect.top >= 0 && rect.top < 130 && !element.closest('[role="row"], [role="listitem"]')) {
+        continue;
+      }
+
+      const root = findItemRoot(element);
+      if (!root || !isVisible(root) || isInsidePanel(root)) continue;
+
+      const rootRect = root.getBoundingClientRect();
       const id = getItemId(root);
-      const key = id || normalizeName(name);
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const key = `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
+
+      if (seenRoots.has(root) || seenKeys.has(key)) continue;
+      seenRoots.add(root);
+      seenKeys.add(key);
       results.push({ name, id, root });
     }
+
     return results;
   }
 
@@ -169,6 +207,17 @@
     return best;
   }
 
+  function getPreviewEvidenceFast() {
+    const progress = getProgressState();
+    const title = findPreviewTitle();
+    return {
+      open: Boolean(title || progress),
+      titleName: title?.name || '',
+      titleElement: title?.element || null,
+      progress
+    };
+  }
+
   function findPreviewCloseButton() {
     const buttons = [...document.querySelectorAll('button, [role="button"]')]
       .filter(element => isVisible(element) && !isInsidePanel(element));
@@ -187,14 +236,7 @@
   }
 
   function getPreviewEvidence() {
-    const title = findPreviewTitle();
-    const progress = getProgressState();
-    return {
-      open: Boolean(title || progress),
-      titleName: title?.name || '',
-      titleElement: title?.element || null,
-      progress
-    };
+    return getPreviewEvidenceFast();
   }
 
   function previewIsOpen() {
@@ -592,7 +634,7 @@
     Object.assign(list.style, { display: 'grid', gap: '2px' });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.7 no longer treats a visible progress slider as the only proof that a preview is open. It also detects the preview title, so WebM/video previews with auto-hidden controls can be confirmed. Still @grant none; no Google API.';
+    note.textContent = 'Probe 0.0.8 restores broad filename discovery inside Drive rows, then climbs from the filename-bearing descendant to the interactive row. Preview-title detection from 0.0.7 is retained. Still @grant none; no Google API.';
     Object.assign(note.style, {
       marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)',
       opacity: '0.65', fontSize: '11px'

@@ -12,6 +12,23 @@ All notable changes to this project will be documented here.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
 
+## [0.0.7] - 2026-09-13
+
+### Changed
+
+- Stop treating a visible progress slider as the only proof that a Drive preview is open.
+- Detect the preview filename/title near the top of the Drive preview, so WebM/video previews can still be confirmed when their transport controls auto-hide.
+- Allow progress-slider discovery even when Drive visually hides the controls but keeps the slider rendered in the DOM.
+- Restrict folder discovery to Drive row/list/grid items instead of broadly scanning arbitrary page text.
+- Keep the last eight transition diagnostics with timestamps instead of overwriting the diagnostic box, so short-lived failure messages remain visible.
+- Extend preview-open confirmation time for slower media previews and record the last preview title seen before a timeout.
+
+### Findings
+
+- In 0.0.6, track 1 -> track 2 could visibly succeed, but the script could still report failure and keep its internal index at track 1.
+- The failing target was a `.webm` item. A WebM/video preview can be visibly open while its playback controls (including the progress slider used by 0.0.6 as the open-state signal) are auto-hidden.
+- This explains why subsequent `Next now` presses kept retrying track 2 even though track 2 was already playing.
+
 ## [0.0.6] - 2026-09-13
 
 ### Changed

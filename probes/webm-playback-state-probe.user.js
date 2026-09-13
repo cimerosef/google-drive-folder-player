@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - WebM Playback State Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
+// @version      0.0.2
 // @description  Diagnostic probe for changing playback-state signals when Google Drive hides WebM/video transport controls.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -42,9 +42,14 @@
     return parts.join('>');
   }
 
+  function nativeInputState(el) {
+    if (!(el instanceof HTMLInputElement)) return '';
+    return ` input[type=${el.type || '-'} value=${el.value || '-'} min=${el.min || '-'} max=${el.max || '-'} step=${el.step || '-'}]`;
+  }
+
   function collectSignals() {
     const out = [];
-    const nodes = document.querySelectorAll('[aria-valuenow], [aria-valuetext], [aria-label], [title], [role="button"], [role="slider"], span, div');
+    const nodes = document.querySelectorAll('[aria-valuenow], [aria-valuetext], [aria-label], [title], [role="button"], [role="slider"], input, span, div');
 
     let ordinal = 0;
     for (const el of nodes) {
@@ -56,15 +61,17 @@
       const ariaLabel = el.getAttribute('aria-label') || '';
       const title = el.getAttribute('title') || '';
       const role = el.getAttribute('role') || '';
+      const native = nativeInputState(el);
 
       const timeLike = TIME_RE.test(text) || TIME_RE.test(ariaText);
       const numeric = ariaNow !== '';
       const stateLike = /play|pause|progress|volume|lecture|pause|progression|volume|播放|暂停|進度|音量/i.test(`${ariaLabel} ${title}`);
+      const inputLike = el instanceof HTMLInputElement;
 
-      if (!timeLike && !numeric && !stateLike) continue;
+      if (!timeLike && !numeric && !stateLike && !inputLike) continue;
 
       const key = `${domPath(el)}#${ordinal++}`;
-      const value = `role=${role || '-'} now=${ariaNow || '-'} valuetext=${shortText(ariaText) || '-'} label=${shortText(ariaLabel || title) || '-'} text=${text || '-'}`;
+      const value = `tag=${el.tagName.toLowerCase()} role=${role || '-'} now=${ariaNow || '-'} valuetext=${shortText(ariaText) || '-'} label=${shortText(ariaLabel || title) || '-'} text=${text || '-'}${native}`;
       out.push({ key, value });
     }
     return out;
@@ -145,19 +152,19 @@
     panel.id = PANEL_ID;
     Object.assign(panel.style, {
       position: 'fixed', right: '18px', bottom: '18px', zIndex: 2147483647,
-      width: '470px', maxHeight: '80vh', overflow: 'auto', boxSizing: 'border-box',
+      width: '520px', maxHeight: '80vh', overflow: 'auto', boxSizing: 'border-box',
       padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)', color: '#f1f3f4',
       boxShadow: '0 8px 30px rgba(0,0,0,.32)', font: '13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif'
     });
 
     const title = document.createElement('div');
-    title.textContent = 'GDFP — WebM Playback State Probe';
+    title.textContent = 'GDFP — WebM Playback State Probe 0.0.2';
     title.style.fontWeight = '650';
     title.style.marginBottom = '8px';
 
     const status = document.createElement('div');
     status.dataset.role = 'status';
-    status.textContent = 'Open and play a WebM/video, let controls hide, then Monitor 10s.';
+    status.textContent = 'Open and play a WebM/video, let controls hide, then Monitor 10s. This version also reports native input value/min/max/step.';
     status.style.marginBottom = '8px';
 
     const controls = document.createElement('div');

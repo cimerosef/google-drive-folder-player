@@ -6,7 +6,7 @@ All notable changes to this project will be documented here.
 
 ### Planned
 
-- Validate repeated next-track transitions and automatic next-track playback on Edge + Violentmonkey.
+- Validate end-of-track detection when Drive auto-hides transport controls (notably some WebM/video previews).
 - Expand folder discovery beyond currently cached/rendered rows.
 - Add shuffle.
 - Add Repeat Off / All / One.
@@ -25,8 +25,11 @@ All notable changes to this project will be documented here.
 
 ### Findings
 
-- Edge + Violentmonkey on 0.0.8 successfully transitioned manually through tracks 1 -> 2 -> 3 -> 4 -> 5.
-- The reliable 0.0.8 path was noticeably slower than earlier probes. The main avoidable costs were repeated preview-state scans during folder discovery plus fixed delays added during stabilization work.
+- Edge + Violentmonkey on 0.0.9 kept repeated `Next now` transitions stable while making track changes noticeably faster.
+- Observed successful transition timings were roughly 650–770 ms in the tested Drive folder.
+- Automatic next-track playback was also confirmed on an MP3 by seeking near the end and letting the track finish naturally.
+- The core playback chain is therefore validated on Edge for visible/cached items: scan -> open -> manual next -> repeated next -> end detection -> automatic next.
+- Some WebM/video previews can still auto-hide the progress control, so their natural end-of-track detection remains a separate edge case to verify before shuffle/repeat are considered robust for mixed-media folders.
 
 ## [0.0.8] - 2026-09-13
 

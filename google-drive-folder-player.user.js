@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.8
-// @description  Prototype continuous Google Drive media playback with robust folder-row discovery and preview-title transition detection.
+// @version      0.0.9
+// @description  Prototype continuous Google Drive media playback with faster preview transitions.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.8';
+  const VERSION = '0.0.9';
   const PANEL_ID = 'gdfp-probe-panel';
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -63,6 +63,7 @@
       element.getAttribute?.('data-tooltip'),
       element.textContent
     ];
+
     for (const value of values) {
       if (!value || value.length > 900) continue;
       const match = value.trim().match(MEDIA_RE);
@@ -81,13 +82,11 @@
 
     for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
       if (!(node instanceof Element) || isInsidePanel(node)) break;
-
       const role = node.getAttribute('role');
       if (role === 'row' || role === 'listitem') return node;
       if (role === 'gridcell' || role === 'rowheader') fallback = node;
       if (node.hasAttribute('data-id') || node.hasAttribute('data-target')) fallback = node;
     }
-
     return fallback;
   }
 
@@ -99,59 +98,10 @@
     return child?.getAttribute('data-id') || child?.getAttribute('data-target') || '';
   }
 
-  function collectFolderRows() {
-    // Drive does not consistently put the filename on the row itself. In the
-    // working 0.0.6 layout it was often on a descendant span/aria-label, so
-    // scan broadly for filename-bearing descendants and climb to the row.
-    const candidates = document.querySelectorAll(
-      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
-    );
-
-    const seenRoots = new Set();
-    const seenKeys = new Set();
-    const results = [];
-
-    for (const element of candidates) {
-      if (isInsidePanel(element)) continue;
-
-      const name = extractMediaName(element);
-      if (!name) continue;
-
-      // When a preview is open, ignore media-looking text in its top chrome.
-      const rect = element.getBoundingClientRect();
-      if (getPreviewEvidenceFast().open && rect.top >= 0 && rect.top < 130 && !element.closest('[role="row"], [role="listitem"]')) {
-        continue;
-      }
-
-      const root = findItemRoot(element);
-      if (!root || !isVisible(root) || isInsidePanel(root)) continue;
-
-      const rootRect = root.getBoundingClientRect();
-      const id = getItemId(root);
-      const key = `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
-
-      if (seenRoots.has(root) || seenKeys.has(key)) continue;
-      seenRoots.add(root);
-      seenKeys.add(key);
-      results.push({ name, id, root });
-    }
-
-    return results;
-  }
-
-  function scanCurrentView() {
-    const results = collectFolderRows();
-    if (results.length) detectedItems = results;
-    renderResults();
-    setStatus(results.length
-      ? `Scan finished: ${results.length} visible media row(s) cached.`
-      : 'No new media rows found. The previous successful scan, if any, is kept.');
-    addDiagnostic(`Scan: ${results.length} live row(s); cache now ${detectedItems.length}.`);
-    return results;
-  }
-
   function findProgressSlider() {
-    const sliders = [...document.querySelectorAll('[role="slider"][aria-valuenow], input[type="range"][aria-valuenow], [aria-valuenow][aria-valuemin][aria-valuemax]')]
+    const sliders = [...document.querySelectorAll(
+      '[role="slider"][aria-valuenow], input[type="range"][aria-valuenow], [aria-valuenow][aria-valuemin][aria-valuemax]'
+    )]
       .filter(element => !isInsidePanel(element) && isRendered(element))
       .map(element => {
         const now = Number(element.getAttribute('aria-valuenow'));
@@ -218,6 +168,57 @@
     };
   }
 
+  function getPreviewEvidence() {
+    return getPreviewEvidenceFast();
+  }
+
+  function collectFolderRows() {
+    const previewOpen = getPreviewEvidenceFast().open;
+    const candidates = document.querySelectorAll(
+      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
+    );
+
+    const seenRoots = new Set();
+    const seenKeys = new Set();
+    const results = [];
+
+    for (const element of candidates) {
+      if (isInsidePanel(element)) continue;
+      const name = extractMediaName(element);
+      if (!name) continue;
+
+      const rect = element.getBoundingClientRect();
+      if (previewOpen && rect.top >= 0 && rect.top < 130 && !element.closest('[role="row"], [role="listitem"]')) {
+        continue;
+      }
+
+      const root = findItemRoot(element);
+      if (!root || !isVisible(root) || isInsidePanel(root)) continue;
+
+      const rootRect = root.getBoundingClientRect();
+      const id = getItemId(root);
+      const key = `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
+      if (seenRoots.has(root) || seenKeys.has(key)) continue;
+
+      seenRoots.add(root);
+      seenKeys.add(key);
+      results.push({ name, id, root });
+    }
+    return results;
+  }
+
+  function scanCurrentView() {
+    const started = performance.now();
+    const results = collectFolderRows();
+    if (results.length) detectedItems = results;
+    renderResults();
+    setStatus(results.length
+      ? `Scan finished: ${results.length} visible media row(s) cached.`
+      : 'No new media rows found. The previous successful scan, if any, is kept.');
+    addDiagnostic(`Scan: ${results.length} live row(s); cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`);
+    return results;
+  }
+
   function findPreviewCloseButton() {
     const buttons = [...document.querySelectorAll('button, [role="button"]')]
       .filter(element => isVisible(element) && !isInsidePanel(element));
@@ -233,14 +234,6 @@
       .map(element => ({ element, rect: element.getBoundingClientRect() }))
       .filter(({ rect }) => rect.top >= 0 && rect.top < 105 && rect.left >= 0 && rect.left < 105 && rect.width <= 90 && rect.height <= 90)
       .sort((a, b) => (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left))[0]?.element || null;
-  }
-
-  function getPreviewEvidence() {
-    return getPreviewEvidenceFast();
-  }
-
-  function previewIsOpen() {
-    return getPreviewEvidence().open;
   }
 
   function clickElement(element) {
@@ -286,20 +279,21 @@
       return false;
     }
 
+    const started = performance.now();
     addDiagnostic(`Closing preview: ${before.titleName || '(title not detected)'}.`);
     clickElement(close);
 
-    for (let i = 0; i < 30; i += 1) {
-      await sleep(100);
+    for (let i = 0; i < 40; i += 1) {
+      await sleep(50);
       if (!getPreviewEvidence().open) {
-        await sleep(350);
-        addDiagnostic('Preview closed and folder view settled.');
+        await sleep(50);
+        addDiagnostic(`Preview closed in ${Math.round(performance.now() - started)} ms.`);
         return true;
       }
     }
 
     setStatus('Transition blocked: Drive ignored the scripted close-button click.');
-    addDiagnostic('Close timed out after 3 seconds.');
+    addDiagnostic('Close timed out after 2 seconds.');
     return false;
   }
 
@@ -309,38 +303,49 @@
     return normalizeName(item.name) === normalizeName(target.name);
   }
 
+  function rowNeedsScroll(root) {
+    const rect = root.getBoundingClientRect();
+    return rect.top < 120 || rect.bottom > window.innerHeight - 24;
+  }
+
   async function resolveFreshItem(target) {
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
       const rows = collectFolderRows();
       let item = rows.find(row => matchesTarget(row, target));
+
       if (item?.root?.isConnected && isVisible(item.root)) {
+        if (!rowNeedsScroll(item.root)) {
+          addDiagnostic(`Resolved row immediately on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
+          return item;
+        }
+
         item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
-        await sleep(220);
+        await sleep(90);
         item = collectFolderRows().find(row => matchesTarget(row, target));
         if (item?.root?.isConnected && isVisible(item.root)) {
-          addDiagnostic(`Resolved row on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
+          addDiagnostic(`Resolved row after scroll on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
           return item;
         }
       }
-      await sleep(180);
+
+      await sleep(attempt < 4 ? 60 : 120);
     }
 
     addDiagnostic(`Row resolution failed: ${target.name}`);
     return null;
   }
 
-  async function waitForPreview(target, timeoutMs = 6500) {
+  async function waitForPreview(target, timeoutMs = 5200) {
     const started = Date.now();
     let lastTitle = '';
+
     while (Date.now() - started < timeoutMs) {
       const evidence = getPreviewEvidence();
       if (evidence.titleName) lastTitle = evidence.titleName;
-      if (evidence.open) {
-        if (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name)) {
-          return { ok: true, evidence };
-        }
+      if (evidence.open && (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name))) {
+        return { ok: true, evidence };
       }
-      await sleep(120);
+      await sleep(60);
     }
     return { ok: false, lastTitle };
   }
@@ -356,7 +361,7 @@
     addDiagnostic(`Open attempt ${attempt}: ${target.name}`);
     dispatchDoubleClick(live.root);
 
-    const result = await waitForPreview(target, 6500);
+    const result = await waitForPreview(target, 5200);
     if (result.ok) {
       addDiagnostic(`Preview confirmed: ${result.evidence.titleName || '(no title; progress control detected)'}.`);
       return true;
@@ -371,6 +376,7 @@
     advancing = true;
     endArmed = false;
     lastRatio = null;
+    const transitionStarted = performance.now();
 
     try {
       const target = playlist[index];
@@ -389,7 +395,7 @@
 
       if (!opened) {
         if (getPreviewEvidence().open) await closePreview();
-        await sleep(300);
+        await sleep(120);
         opened = await tryOpenTarget(target, index, reason, 2);
       }
 
@@ -402,9 +408,10 @@
       }
 
       currentIndex = index;
+      const elapsed = Math.round(performance.now() - transitionStarted);
       setStatus(`Playing ${index + 1}/${playlist.length}: ${target.name}`);
-      renderPlaybackState('Waiting for progress');
-      addDiagnostic(`Transition accepted -> track ${index + 1}/${playlist.length}.`);
+      renderPlaybackState(`Ready · transition ${elapsed} ms`);
+      addDiagnostic(`Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.`);
       startMonitor();
       return true;
     } finally {
@@ -461,6 +468,7 @@
     if (!autoMode || advancing || currentIndex < 0) return;
     endArmed = false;
     const nextIndex = currentIndex + 1;
+
     if (nextIndex >= playlist.length) {
       autoMode = false;
       setStatus(`Cached playlist finished (${playlist.length} track(s)).`);
@@ -468,6 +476,7 @@
       addDiagnostic('Playlist finished.');
       return;
     }
+
     setStatus(`End detected. Advancing to ${nextIndex + 1}/${playlist.length}…`);
     addDiagnostic(`End inferred for track ${currentIndex + 1}; advancing.`);
     await openPlaylistIndex(nextIndex, 'automatic next');
@@ -537,8 +546,10 @@
     const count = document.querySelector(`#${PANEL_ID} [data-gdfp="count"]`);
     const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
     if (!count || !list) return;
+
     count.textContent = `${detectedItems.length} cached visible media item(s)`;
     list.replaceChildren();
+
     for (const item of detectedItems.slice(0, 8)) {
       const row = document.createElement('div');
       row.textContent = item.name;
@@ -548,6 +559,7 @@
       row.style.textOverflow = 'ellipsis';
       list.appendChild(row);
     }
+
     if (detectedItems.length > 8) {
       const more = document.createElement('div');
       more.textContent = `… +${detectedItems.length - 8} more`;
@@ -634,7 +646,7 @@
     Object.assign(list.style, { display: 'grid', gap: '2px' });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.8 restores broad filename discovery inside Drive rows, then climbs from the filename-bearing descendant to the interactive row. Preview-title detection from 0.0.7 is retained. Still @grant none; no Google API.';
+    note.textContent = 'Probe 0.0.9 keeps the reliable 0.0.8 transition path but removes conservative fixed waits and avoids repeatedly rescanning preview state for every Drive DOM candidate. Transition timings are shown for comparison. Still @grant none; no Google API.';
     Object.assign(note.style, {
       marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)',
       opacity: '0.65', fontSize: '11px'

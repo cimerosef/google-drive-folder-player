@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - WebM Auto-Next Bridge Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
-// @description  Integration probe: mirror Drive's live hidden WebM/video range input into a synthetic progress slider that GDFP 0.0.9 can monitor.
+// @version      0.0.2
+// @description  Integration probe: mirror Drive's live hidden WebM/video range input into a temporary synthetic progress slider that GDFP 0.0.9 can monitor.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -16,9 +16,11 @@
   const PROXY_ID = 'gdfp-webm-progress-proxy';
   const PANEL_ID = 'gdfp-webm-bridge-status';
   const SAMPLE_MS = 200;
+  const LIVE_GRACE_MS = 750;
 
   let previousValues = new WeakMap();
   let activeInput = null;
+  let lastMovementAt = 0;
 
   function numericRange(input) {
     if (!(input instanceof HTMLInputElement) || input.type !== 'range') return null;
@@ -56,7 +58,7 @@
       top: '0',
       width: '1px',
       height: '1px',
-      display: 'block',
+      display: 'none',
       opacity: '0',
       pointerEvents: 'none'
     });
@@ -69,8 +71,14 @@
     if (node) node.textContent = text;
   }
 
+  function hideProxy() {
+    const proxy = ensureProxy();
+    proxy.style.display = 'none';
+  }
+
   function updateProxy(state) {
     const proxy = ensureProxy();
+    proxy.style.display = 'block';
     proxy.setAttribute('aria-valuenow', String(Math.round(state.ratio * 1000)));
     proxy.dataset.sourceMax = String(state.max);
     proxy.dataset.sourceValue = String(state.value);
@@ -89,14 +97,24 @@
 
     // A moving candidate is much safer than simply choosing one of Drive's
     // many stale 0x0 range inputs. The newest moving candidate becomes active.
-    if (changed) activeInput = changed.input;
+    if (changed) {
+      activeInput = changed.input;
+      lastMovementAt = Date.now();
+    }
 
     const active = list.find(state => state.input === activeInput);
-    if (active) {
+    const live = active && Date.now() - lastMovementAt <= LIVE_GRACE_MS;
+
+    if (live) {
       updateProxy(active);
       return;
     }
 
+    // Do not leave the synthetic slider rendered while playback is paused,
+    // after a preview closes, or before a real moving range has been found.
+    // Otherwise GDFP 0.0.9 could mistake the proxy itself for proof that a
+    // Drive preview is still open.
+    hideProxy();
     setPanel(`Waiting for a changing hidden media range… (${list.length} duration-style candidate(s) present)`);
   }
 
@@ -112,7 +130,7 @@
       font: '12px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif'
     });
     const title = document.createElement('div');
-    title.textContent = 'GDFP — WebM Auto-Next Bridge 0.0.1';
+    title.textContent = 'GDFP — WebM Auto-Next Bridge 0.0.2';
     title.style.fontWeight = '650';
     const status = document.createElement('div');
     status.dataset.role = 'status';

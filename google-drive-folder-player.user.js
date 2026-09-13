@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.6
-// @description  Prototype continuous Google Drive audio playback with fresh row resolution between preview transitions.
+// @version      0.0.7
+// @description  Prototype continuous Google Drive media playback with preview-title based transition detection.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,14 +13,14 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.6';
+  const VERSION = '0.0.7';
   const PANEL_ID = 'gdfp-probe-panel';
-  const AUDIO_EXTENSIONS = [
+  const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
-    'webm', 'aiff', 'aif', 'm4b'
+    'webm', 'aiff', 'aif', 'm4b', 'mp4'
   ];
-  const AUDIO_RE = new RegExp(
-    `([^\\/\\n\\r]{1,240}\\.(?:${AUDIO_EXTENSIONS.join('|')}))(?=\\s|$)`,
+  const MEDIA_RE = new RegExp(
+    `([^\\/\\n\\r]{1,320}\\.(?:${MEDIA_EXTENSIONS.join('|')}))(?=\\s|$)`,
     'i'
   );
 
@@ -32,6 +32,7 @@
   let endArmed = false;
   let monitorTimer = null;
   let lastRatio = null;
+  let diagnosticHistory = [];
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const log = (...args) => console.log('[GDFP Probe]', ...args);
@@ -44,11 +45,18 @@
     return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0;
   }
 
+  function isRendered(element) {
+    if (!(element instanceof Element) || !element.isConnected) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return getComputedStyle(element).display !== 'none';
+  }
+
   function isInsidePanel(element) {
     return Boolean(element.closest?.(`#${PANEL_ID}`));
   }
 
-  function extractAudioName(element) {
+  function extractMediaName(element) {
     const values = [
       element.getAttribute?.('aria-label'),
       element.getAttribute?.('title'),
@@ -56,24 +64,15 @@
       element.textContent
     ];
     for (const value of values) {
-      if (!value || value.length > 600) continue;
-      const match = value.trim().match(AUDIO_RE);
+      if (!value || value.length > 900) continue;
+      const match = value.trim().match(MEDIA_RE);
       if (match) return match[1].trim();
     }
     return null;
   }
 
-  function findItemRoot(element) {
-    let node = element;
-    let fallback = element;
-    for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
-      if (!(node instanceof Element) || isInsidePanel(node)) break;
-      const role = node.getAttribute('role');
-      if (role === 'row' || role === 'listitem') return node;
-      if (role === 'gridcell' || role === 'rowheader') fallback = node;
-      if (node.hasAttribute('data-id') || node.hasAttribute('data-target')) fallback = node;
-    }
-    return fallback;
+  function normalizeName(name) {
+    return String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
   function getItemId(root) {
@@ -84,35 +83,57 @@
     return child?.getAttribute('data-id') || child?.getAttribute('data-target') || '';
   }
 
-  function getVisibleSliders() {
-    return [...document.querySelectorAll('[role="slider"], input[type="range"], [aria-valuenow]')]
-      .filter(element => isVisible(element) && !isInsidePanel(element))
-      .filter(element => {
-        const now = Number(element.getAttribute('aria-valuenow'));
-        const min = Number(element.getAttribute('aria-valuemin'));
-        const max = Number(element.getAttribute('aria-valuemax'));
-        return [now, min, max].every(Number.isFinite) && max > min;
-      });
+  function collectFolderRows() {
+    const roots = [...document.querySelectorAll('[role="row"], [role="listitem"], [role="gridcell"]')]
+      .filter(root => isVisible(root) && !isInsidePanel(root));
+
+    const seen = new Set();
+    const results = [];
+    for (const root of roots) {
+      const name = extractMediaName(root);
+      if (!name) continue;
+      const id = getItemId(root);
+      const key = id || normalizeName(name);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ name, id, root });
+    }
+    return results;
+  }
+
+  function scanCurrentView() {
+    const results = collectFolderRows();
+    if (results.length) detectedItems = results;
+    renderResults();
+    setStatus(results.length
+      ? `Scan finished: ${results.length} visible media row(s) cached.`
+      : 'No new media rows found. The previous successful scan, if any, is kept.');
+    addDiagnostic(`Scan: ${results.length} live row(s); cache now ${detectedItems.length}.`);
+    return results;
   }
 
   function findProgressSlider() {
-    const sliders = getVisibleSliders();
-    if (!sliders.length) return null;
-    return sliders
+    const sliders = [...document.querySelectorAll('[role="slider"][aria-valuenow], input[type="range"][aria-valuenow], [aria-valuenow][aria-valuemin][aria-valuemax]')]
+      .filter(element => !isInsidePanel(element) && isRendered(element))
       .map(element => {
+        const now = Number(element.getAttribute('aria-valuenow'));
         const min = Number(element.getAttribute('aria-valuemin'));
         const max = Number(element.getAttribute('aria-valuemax'));
         const span = max - min;
         const rect = element.getBoundingClientRect();
-        return { element, span, width: rect.width };
+        return { element, now, min, max, span, width: rect.width };
       })
-      .sort((a, b) => {
-        const ap = a.span > 100 ? 1 : 0;
-        const bp = b.span > 100 ? 1 : 0;
-        if (ap !== bp) return bp - ap;
-        if (a.span !== b.span) return b.span - a.span;
-        return b.width - a.width;
-      })[0]?.element || null;
+      .filter(item => [item.now, item.min, item.max].every(Number.isFinite) && item.max > item.min);
+
+    if (!sliders.length) return null;
+    sliders.sort((a, b) => {
+      const ap = a.span > 100 ? 1 : 0;
+      const bp = b.span > 100 ? 1 : 0;
+      if (ap !== bp) return bp - ap;
+      if (a.span !== b.span) return b.span - a.span;
+      return b.width - a.width;
+    });
+    return sliders[0].element;
   }
 
   function getProgressState() {
@@ -131,54 +152,67 @@
     };
   }
 
-  function previewIsOpen() {
-    return Boolean(findProgressSlider());
-  }
-
-  function isLikelyPreviewElement(element) {
-    if (!(element instanceof Element) || !isVisible(element)) return false;
-    const rect = element.getBoundingClientRect();
-    return rect.top < 140 || Boolean(element.closest?.('[role="dialog"]'));
-  }
-
-  function collectFolderRows() {
-    const candidates = document.querySelectorAll(
-      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
-    );
-    const seenRoots = new Set();
-    const seenKeys = new Set();
-    const results = [];
+  function findPreviewTitle() {
+    const candidates = [...document.querySelectorAll('[aria-label], [title], span, div')];
+    let best = null;
 
     for (const element of candidates) {
-      if (isInsidePanel(element)) continue;
-      const name = extractAudioName(element);
+      if (isInsidePanel(element) || !isVisible(element)) continue;
+      if (element.closest('[role="row"], [role="listitem"], [role="gridcell"]')) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.top < 0 || rect.top > 115 || rect.left < 25) continue;
+      const name = extractMediaName(element);
       if (!name) continue;
-      if (previewIsOpen() && isLikelyPreviewElement(element) && !element.closest('[role="row"], [role="listitem"]')) continue;
-
-      const root = findItemRoot(element);
-      if (!root || !isVisible(root)) continue;
-      const role = root.getAttribute('role');
-      if (previewIsOpen() && role !== 'row' && role !== 'listitem' && isLikelyPreviewElement(root)) continue;
-
-      const rect = root.getBoundingClientRect();
-      const id = getItemId(root);
-      const key = `${id || name.toLowerCase()}::${Math.round(rect.top)}::${Math.round(rect.left)}`;
-      if (seenRoots.has(root) || seenKeys.has(key)) continue;
-      seenRoots.add(root);
-      seenKeys.add(key);
-      results.push({ name, id, root });
+      const score = (element.children.length === 0 ? 20 : 0) + Math.max(0, 500 - rect.left) / 100;
+      if (!best || score > best.score) best = { element, name, score };
     }
-    return results;
+    return best;
   }
 
-  function scanCurrentView() {
-    const results = collectFolderRows();
-    if (results.length) detectedItems = results;
-    renderResults();
-    setStatus(results.length
-      ? `Scan finished: ${results.length} visible audio row(s) cached.`
-      : 'No new folder rows found. The previous successful scan, if any, is kept.');
-    return results;
+  function findPreviewCloseButton() {
+    const buttons = [...document.querySelectorAll('button, [role="button"]')]
+      .filter(element => isVisible(element) && !isInsidePanel(element));
+
+    const textMatch = /close|fermer|schlie|cerrar|chiudi|fechar|sluiten|关闭|關閉|閉じ|닫기/i;
+    const labelled = buttons.find(element => {
+      const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`;
+      return textMatch.test(label);
+    });
+    if (labelled) return labelled;
+
+    return buttons
+      .map(element => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.top >= 0 && rect.top < 105 && rect.left >= 0 && rect.left < 105 && rect.width <= 90 && rect.height <= 90)
+      .sort((a, b) => (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left))[0]?.element || null;
+  }
+
+  function getPreviewEvidence() {
+    const title = findPreviewTitle();
+    const progress = getProgressState();
+    return {
+      open: Boolean(title || progress),
+      titleName: title?.name || '',
+      titleElement: title?.element || null,
+      progress
+    };
+  }
+
+  function previewIsOpen() {
+    return getPreviewEvidence().open;
+  }
+
+  function clickElement(element) {
+    if (!element) return;
+    try {
+      element.click();
+    } catch {
+      element.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window
+      }));
+    }
   }
 
   function dispatchDoubleClick(element) {
@@ -199,99 +233,74 @@
     element.dispatchEvent(new MouseEvent('dblclick', { ...common, detail: 2 }));
   }
 
-  function findPreviewCloseButton() {
-    const buttons = [...document.querySelectorAll('button, [role="button"]')]
-      .filter(element => isVisible(element) && !isInsidePanel(element));
-
-    const textMatch = /close|fermer|schlie|cerrar|chiudi|fechar|sluiten|关闭|關閉|閉じ|닫기/i;
-    const labelled = buttons.find(element => {
-      const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`;
-      return textMatch.test(label);
-    });
-    if (labelled) return labelled;
-
-    return buttons
-      .map(element => ({ element, rect: element.getBoundingClientRect() }))
-      .filter(({ rect }) => rect.top >= 0 && rect.top < 110 && rect.left >= 0 && rect.left < 110 && rect.width <= 90 && rect.height <= 90)
-      .sort((a, b) => (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left))[0]?.element || null;
-  }
-
-  function clickElement(element) {
-    if (!element) return;
-    try {
-      element.click();
-    } catch {
-      element.dispatchEvent(new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        view: window
-      }));
-    }
-  }
-
   async function closePreview() {
-    if (!previewIsOpen()) return true;
+    const before = getPreviewEvidence();
+    if (!before.open) return true;
 
     const close = findPreviewCloseButton();
     if (!close) {
       setStatus('Transition blocked: preview is open but its close control was not found.');
+      addDiagnostic(`Close failed: no close control. Preview title: ${before.titleName || '(none)'}.`);
       return false;
     }
 
-    setStatus('Closing the current Drive preview via its visible close control…');
+    addDiagnostic(`Closing preview: ${before.titleName || '(title not detected)'}.`);
     clickElement(close);
 
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 30; i += 1) {
       await sleep(100);
-      if (!previewIsOpen()) {
-        // Give Drive time to restore/rebuild the folder list after the preview disappears.
-        await sleep(300);
+      if (!getPreviewEvidence().open) {
+        await sleep(350);
+        addDiagnostic('Preview closed and folder view settled.');
         return true;
       }
     }
 
     setStatus('Transition blocked: Drive ignored the scripted close-button click.');
+    addDiagnostic('Close timed out after 3 seconds.');
     return false;
   }
 
   function matchesTarget(item, target) {
     if (!item || !target) return false;
     if (target.id && item.id) return item.id === target.id;
-    return item.name.toLowerCase() === target.name.toLowerCase();
+    return normalizeName(item.name) === normalizeName(target.name);
   }
 
   async function resolveFreshItem(target) {
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
       const rows = collectFolderRows();
       let item = rows.find(row => matchesTarget(row, target));
-
       if (item?.root?.isConnected && isVisible(item.root)) {
         item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
-        // Scrolling can trigger Drive virtualization, so reacquire the row afterwards.
         await sleep(220);
-        const settledRows = collectFolderRows();
-        item = settledRows.find(row => matchesTarget(row, target));
+        item = collectFolderRows().find(row => matchesTarget(row, target));
         if (item?.root?.isConnected && isVisible(item.root)) {
-          setDiagnostic(`Fresh row resolved on attempt ${attempt}. Stable id: ${target.id ? 'yes' : 'no'}.`);
+          addDiagnostic(`Resolved row on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
           return item;
         }
       }
-
       await sleep(180);
     }
 
-    setDiagnostic(`Fresh row resolution failed for: ${target.name}`);
+    addDiagnostic(`Row resolution failed: ${target.name}`);
     return null;
   }
 
-  async function waitForPreview(timeoutMs = 5000) {
+  async function waitForPreview(target, timeoutMs = 6500) {
     const started = Date.now();
+    let lastTitle = '';
     while (Date.now() - started < timeoutMs) {
-      if (previewIsOpen()) return true;
-      await sleep(100);
+      const evidence = getPreviewEvidence();
+      if (evidence.titleName) lastTitle = evidence.titleName;
+      if (evidence.open) {
+        if (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name)) {
+          return { ok: true, evidence };
+        }
+      }
+      await sleep(120);
     }
-    return false;
+    return { ok: false, lastTitle };
   }
 
   async function tryOpenTarget(target, index, reason, attempt) {
@@ -302,8 +311,17 @@
     }
 
     setStatus(`Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}): ${target.name}`);
+    addDiagnostic(`Open attempt ${attempt}: ${target.name}`);
     dispatchDoubleClick(live.root);
-    return waitForPreview(4500);
+
+    const result = await waitForPreview(target, 6500);
+    if (result.ok) {
+      addDiagnostic(`Preview confirmed: ${result.evidence.titleName || '(no title; progress control detected)'}.`);
+      return true;
+    }
+
+    addDiagnostic(`Open attempt ${attempt} timed out. Last preview title: ${result.lastTitle || '(none)'}.`);
+    return false;
   }
 
   async function openPlaylistIndex(index, reason = 'manual') {
@@ -316,11 +334,19 @@
       const target = playlist[index];
       const previousIndex = currentIndex;
 
-      if (previewIsOpen() && !(await closePreview())) return false;
+      if (getPreviewEvidence().open && !(await closePreview())) return false;
 
       let opened = await tryOpenTarget(target, index, reason, 1);
       if (!opened) {
-        setDiagnostic(`First open attempt failed for ${target.name}. Reacquiring the live row and retrying once.`);
+        const evidence = getPreviewEvidence();
+        if (evidence.open && (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name))) {
+          opened = true;
+          addDiagnostic('Late preview detected after timeout; accepting transition.');
+        }
+      }
+
+      if (!opened) {
+        if (getPreviewEvidence().open) await closePreview();
         await sleep(300);
         opened = await tryOpenTarget(target, index, reason, 2);
       }
@@ -329,14 +355,14 @@
         setStatus(`Transition failed: Drive preview did not open for ${target.name}`);
         currentIndex = previousIndex;
         renderPlaybackState('Transition failed; current index preserved');
+        addDiagnostic(`Transition failed; index remains ${previousIndex + 1}/${playlist.length}.`);
         return false;
       }
 
-      // Only commit the new playlist position after Drive confirms that the preview opened.
       currentIndex = index;
       setStatus(`Playing ${index + 1}/${playlist.length}: ${target.name}`);
       renderPlaybackState('Waiting for progress');
-      setDiagnostic(`Transition succeeded to track ${index + 1}/${playlist.length}.`);
+      addDiagnostic(`Transition accepted -> track ${index + 1}/${playlist.length}.`);
       startMonitor();
       return true;
     } finally {
@@ -347,14 +373,15 @@
   async function startContinuousTest() {
     if (!detectedItems.length) scanCurrentView();
     if (!detectedItems.length) {
-      setStatus('No audio rows cached. Close preview, scan the folder, then retry.');
+      setStatus('No media rows cached. Close preview, scan the folder, then retry.');
       return;
     }
 
     autoMode = true;
     playlist = detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
     currentIndex = -1;
-    setDiagnostic(`Playlist captured: ${playlist.length} item(s); ${playlist.filter(item => item.id).length} with stable Drive ids.`);
+    diagnosticHistory = [];
+    addDiagnostic(`Playlist captured: ${playlist.length}; ${playlist.filter(item => item.id).length} with stable Drive ids.`);
     await openPlaylistIndex(0, 'start');
   }
 
@@ -368,14 +395,13 @@
     }
     setStatus('Continuous test stopped. Drive playback itself was left untouched.');
     renderPlaybackState('Stopped');
+    addDiagnostic('Continuous test stopped.');
   }
 
   async function nextNow() {
+    if (!playlist.length) playlist = detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
     if (!playlist.length) {
-      playlist = detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
-    }
-    if (!playlist.length) {
-      setStatus('No cached audio items. Scan the folder first.');
+      setStatus('No cached media items. Scan the folder first.');
       return;
     }
 
@@ -397,17 +423,19 @@
       autoMode = false;
       setStatus(`Cached playlist finished (${playlist.length} track(s)).`);
       renderPlaybackState('Playlist finished');
+      addDiagnostic('Playlist finished.');
       return;
     }
     setStatus(`End detected. Advancing to ${nextIndex + 1}/${playlist.length}…`);
+    addDiagnostic(`End inferred for track ${currentIndex + 1}; advancing.`);
     await openPlaylistIndex(nextIndex, 'automatic next');
   }
 
   function monitorTick() {
-    if (!autoMode || advancing || !previewIsOpen()) return;
+    if (!autoMode || advancing || currentIndex < 0) return;
     const progress = getProgressState();
     if (!progress) {
-      renderPlaybackState('No progress slider');
+      renderPlaybackState('Preview open; progress control unavailable/hidden');
       return;
     }
 
@@ -428,22 +456,17 @@
     monitorTimer = setInterval(monitorTick, 250);
   }
 
-  function probePreviewUi() {
-    const progress = getProgressState();
+  function probeTransition() {
+    const evidence = getPreviewEvidence();
     const close = findPreviewCloseButton();
-    if (!previewIsOpen()) {
-      setDiagnostic('No Drive audio preview detected.');
-      return;
-    }
-
+    const title = evidence.titleName || '(none)';
+    const progress = evidence.progress
+      ? `${Math.round(evidence.progress.ratio * 1000) / 10}% [${evidence.progress.min}..${evidence.progress.max}]`
+      : '(none)';
     const closeDesc = close
-      ? `${close.tagName.toLowerCase()} label="${close.getAttribute('aria-label') || close.getAttribute('title') || '(none)'}" @ ${Math.round(close.getBoundingClientRect().left)},${Math.round(close.getBoundingClientRect().top)}`
-      : 'not found';
-    setDiagnostic(
-      `Progress: ${progress ? `${Math.round(progress.ratio * 1000) / 10}% [${progress.min}..${progress.max}]` : 'not found'}\n` +
-      `Close control: ${closeDesc}\n` +
-      `Current playlist index: ${currentIndex >= 0 ? currentIndex + 1 : 'none'}`
-    );
+      ? `${close.tagName.toLowerCase()} label="${close.getAttribute('aria-label') || close.getAttribute('title') || '(none)'}"`
+      : '(none)';
+    addDiagnostic(`Probe -> open=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`);
   }
 
   function setStatus(text) {
@@ -451,9 +474,13 @@
     if (node) node.textContent = text;
   }
 
-  function setDiagnostic(text) {
+  function addDiagnostic(text) {
+    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    diagnosticHistory.push(`${stamp}  ${text}`);
+    diagnosticHistory = diagnosticHistory.slice(-8);
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="diagnostic"]`);
-    if (node) node.textContent = text;
+    if (node) node.textContent = diagnosticHistory.join('\n');
+    log(text);
   }
 
   function renderPlaybackState(detail = '') {
@@ -468,8 +495,7 @@
     const count = document.querySelector(`#${PANEL_ID} [data-gdfp="count"]`);
     const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
     if (!count || !list) return;
-
-    count.textContent = `${detectedItems.length} cached visible audio item(s)`;
+    count.textContent = `${detectedItems.length} cached visible media item(s)`;
     list.replaceChildren();
     for (const item of detectedItems.slice(0, 8)) {
       const row = document.createElement('div');
@@ -511,19 +537,10 @@
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
     Object.assign(panel.style, {
-      position: 'fixed',
-      right: '18px',
-      bottom: '18px',
-      zIndex: '2147483647',
-      width: '400px',
-      maxHeight: '78vh',
-      overflow: 'auto',
-      boxSizing: 'border-box',
-      padding: '12px',
-      borderRadius: '12px',
-      background: 'rgba(32,33,36,.97)',
-      color: '#f1f3f4',
-      boxShadow: '0 8px 30px rgba(0,0,0,.32)',
+      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647',
+      width: '410px', maxHeight: '78vh', overflow: 'auto', boxSizing: 'border-box',
+      padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)',
+      color: '#f1f3f4', boxShadow: '0 8px 30px rgba(0,0,0,.32)',
       font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
 
@@ -538,44 +555,30 @@
     status.style.marginBottom = '9px';
 
     const controls = document.createElement('div');
-    Object.assign(controls.style, {
-      display: 'flex',
-      gap: '7px',
-      flexWrap: 'wrap',
-      marginBottom: '9px'
-    });
+    Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
     controls.append(
       makeButton('Scan folder view', scanCurrentView),
       makeButton('Start continuous test', startContinuousTest),
       makeButton('Next now', nextNow),
       makeButton('Stop', stopContinuousTest),
-      makeButton('Probe transition', probePreviewUi)
+      makeButton('Probe transition', probeTransition)
     );
 
     const playback = document.createElement('div');
     playback.dataset.gdfp = 'playback-status';
     playback.textContent = 'Continuous: OFF | Track: —';
     Object.assign(playback.style, {
-      marginBottom: '9px',
-      padding: '8px',
-      borderRadius: '7px',
-      whiteSpace: 'pre-wrap',
-      background: 'rgba(129,201,149,.12)',
-      border: '1px solid rgba(129,201,149,.28)',
-      overflowWrap: 'anywhere'
+      marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      background: 'rgba(129,201,149,.12)', border: '1px solid rgba(129,201,149,.28)', overflowWrap: 'anywhere'
     });
 
     const diagnostic = document.createElement('div');
     diagnostic.dataset.gdfp = 'diagnostic';
-    diagnostic.textContent = 'Transition diagnostic: not run yet.';
+    diagnostic.textContent = 'Transition history will appear here.';
     Object.assign(diagnostic.style, {
-      marginBottom: '9px',
-      padding: '8px',
-      borderRadius: '7px',
-      whiteSpace: 'pre-wrap',
-      background: 'rgba(138,180,248,.12)',
-      border: '1px solid rgba(138,180,248,.28)',
-      overflowWrap: 'anywhere'
+      marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      background: 'rgba(138,180,248,.12)', border: '1px solid rgba(138,180,248,.28)', overflowWrap: 'anywhere',
+      fontSize: '11px'
     });
 
     const count = document.createElement('div');
@@ -589,13 +592,10 @@
     Object.assign(list.style, { display: 'grid', gap: '2px' });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.6 reacquires a fresh Drive row after every preview close and after scrolling, then retries one failed open. Failed transitions no longer advance the playlist index. Still @grant none; no Google API.';
+    note.textContent = 'Probe 0.0.7 no longer treats a visible progress slider as the only proof that a preview is open. It also detects the preview title, so WebM/video previews with auto-hidden controls can be confirmed. Still @grant none; no Google API.';
     Object.assign(note.style, {
-      marginTop: '9px',
-      paddingTop: '8px',
-      borderTop: '1px solid rgba(255,255,255,.16)',
-      opacity: '0.65',
-      fontSize: '11px'
+      marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)',
+      opacity: '0.65', fontSize: '11px'
     });
 
     panel.append(title, status, controls, playback, diagnostic, count, list, note);

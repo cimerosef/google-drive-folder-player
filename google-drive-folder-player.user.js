@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.10
-// @description  Continuous Google Drive media playback with native hidden WebM/video progress detection.
+// @version      0.0.11
+// @description  Continuous Google Drive media playback with an optional shuffled playback queue.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.10';
+  const VERSION = '0.0.11';
   const PANEL_ID = 'gdfp-probe-panel';
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -27,6 +27,8 @@
   let detectedItems = [];
   let playlist = [];
   let currentIndex = -1;
+  let shuffleMode = false;
+  let playlistShuffled = false;
   let autoMode = false;
   let advancing = false;
   let endArmed = false;
@@ -46,7 +48,9 @@
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return false;
     const style = getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0;
+    return style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) !== 0;
   }
 
   function isRendered(element) {
@@ -57,7 +61,7 @@
   }
 
   function isInsidePanel(element) {
-    return Boolean(element.closest?.(`#${PANEL_ID}`));
+    return Boolean(element?.closest?.(`#${PANEL_ID}`));
   }
 
   function extractMediaName(element) {
@@ -97,7 +101,9 @@
     const direct = root.getAttribute('data-id') || root.getAttribute('data-target');
     if (direct) return direct;
     const child = root.querySelector('[data-id], [data-target]');
-    return child?.getAttribute('data-id') || child?.getAttribute('data-target') || '';
+    return child?.getAttribute('data-id') ||
+      child?.getAttribute('data-target') ||
+      '';
   }
 
   function findVisibleProgressSlider() {
@@ -113,7 +119,10 @@
         const rect = element.getBoundingClientRect();
         return { element, now, min, max, span, width: rect.width };
       })
-      .filter(item => [item.now, item.min, item.max].every(Number.isFinite) && item.max > item.min);
+      .filter(item =>
+        [item.now, item.min, item.max].every(Number.isFinite) &&
+        item.max > item.min
+      );
 
     if (!sliders.length) return null;
     sliders.sort((a, b) => {
@@ -190,6 +199,7 @@
   function findTopLeftCloseControl() {
     const buttons = [...document.querySelectorAll('button, [role="button"]')]
       .filter(element => isVisible(element) && !isInsidePanel(element));
+
     const textMatch = /close|fermer|schlie|cerrar|chiudi|fechar|sluiten|关闭|關閉|閉じ|닫기/i;
     const labelled = buttons.find(element => {
       const rect = element.getBoundingClientRect();
@@ -198,25 +208,49 @@
       return textMatch.test(label);
     });
     if (labelled) return labelled;
+
     return buttons
       .map(element => ({ element, rect: element.getBoundingClientRect() }))
-      .filter(({ rect }) => rect.top >= 0 && rect.top < 105 && rect.left >= 0 && rect.left < 105 && rect.width <= 90 && rect.height <= 90)
-      .sort((a, b) => (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left))[0]?.element || null;
+      .filter(({ rect }) =>
+        rect.top >= 0 &&
+        rect.top < 105 &&
+        rect.left >= 0 &&
+        rect.left < 105 &&
+        rect.width <= 90 &&
+        rect.height <= 90
+      )
+      .sort((a, b) =>
+        (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left)
+      )[0]?.element || null;
   }
 
   function findPreviewTitle() {
     const candidates = [...document.querySelectorAll('[aria-label], [title], span, div')];
     let best = null;
     const maxLeft = Math.min(window.innerWidth * 0.68, 980);
+
     for (const element of candidates) {
       if (isInsidePanel(element) || !isVisible(element)) continue;
       if (element.closest('[role="row"], [role="listitem"], [role="gridcell"]')) continue;
+
       const rect = element.getBoundingClientRect();
-      if (rect.top < 0 || rect.top > 115 || rect.left < 25 || rect.left > maxLeft) continue;
+      if (
+        rect.top < 0 ||
+        rect.top > 115 ||
+        rect.left < 25 ||
+        rect.left > maxLeft
+      ) continue;
+
       const name = extractMediaName(element);
       if (!name) continue;
-      const score = (element.children.length === 0 ? 20 : 0) + Math.max(0, 500 - rect.left) / 100;
-      if (!best || score > best.score) best = { element, name, score };
+
+      const score =
+        (element.children.length === 0 ? 20 : 0) +
+        Math.max(0, 500 - rect.left) / 100;
+
+      if (!best || score > best.score) {
+        best = { element, name, score };
+      }
     }
     return best;
   }
@@ -225,6 +259,7 @@
     const progress = getProgressState();
     const title = findPreviewTitle();
     const close = findTopLeftCloseControl();
+
     return {
       open: Boolean(progress || (title && close)),
       titleName: title?.name || '',
@@ -243,37 +278,58 @@
     const candidates = document.querySelectorAll(
       '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
     );
+
     const seenRoots = new Set();
     const seenKeys = new Set();
     const results = [];
+
     for (const element of candidates) {
       if (isInsidePanel(element)) continue;
       const name = extractMediaName(element);
       if (!name) continue;
+
       const rect = element.getBoundingClientRect();
-      if (previewOpen && rect.top >= 0 && rect.top < 130 && !element.closest('[role="row"], [role="listitem"]')) continue;
+      if (
+        previewOpen &&
+        rect.top >= 0 &&
+        rect.top < 130 &&
+        !element.closest('[role="row"], [role="listitem"]')
+      ) continue;
+
       const root = findItemRoot(element);
       if (!root || !isVisible(root) || isInsidePanel(root)) continue;
+
       const rootRect = root.getBoundingClientRect();
       const id = getItemId(root);
-      const key = `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
+      const key =
+        `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
+
       if (seenRoots.has(root) || seenKeys.has(key)) continue;
+
       seenRoots.add(root);
       seenKeys.add(key);
       results.push({ name, id, root });
     }
+
     return results;
   }
 
   function scanCurrentView() {
     const started = performance.now();
     const results = collectFolderRows();
+
     if (results.length) detectedItems = results;
     renderResults();
-    setStatus(results.length
-      ? `Scan finished: ${results.length} visible media row(s) cached.`
-      : 'No new media rows found. The previous successful scan, if any, is kept.');
-    addDiagnostic(`Scan: ${results.length} live row(s); cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`);
+
+    setStatus(
+      results.length
+        ? `Scan finished: ${results.length} visible media row(s) cached.`
+        : 'No new media rows found. The previous successful scan, if any, is kept.'
+    );
+
+    addDiagnostic(
+      `Scan: ${results.length} live row(s); cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`
+    );
     return results;
   }
 
@@ -304,6 +360,7 @@
       button: 0,
       buttons: 1
     };
+
     element.dispatchEvent(new MouseEvent('mousedown', { ...common, detail: 1 }));
     element.dispatchEvent(new MouseEvent('mouseup', { ...common, detail: 1 }));
     element.dispatchEvent(new MouseEvent('click', { ...common, detail: 1 }));
@@ -316,23 +373,31 @@
   async function closePreview() {
     const before = getPreviewEvidence();
     if (!before.open) return true;
+
     const close = before.close || findPreviewCloseButton();
     if (!close) {
       setStatus('Transition blocked: preview is open but its close control was not found.');
-      addDiagnostic(`Close failed: no close control. Preview title: ${before.titleName || '(none)'}.`);
+      addDiagnostic(
+        `Close failed: no close control. Preview title: ${before.titleName || '(none)'}.`
+      );
       return false;
     }
+
     const started = performance.now();
     addDiagnostic(`Closing preview: ${before.titleName || '(title not detected)'}.`);
     clickElement(close);
+
     for (let i = 0; i < 40; i += 1) {
       await sleep(50);
       if (!getPreviewEvidence().open) {
         await sleep(50);
-        addDiagnostic(`Preview closed in ${Math.round(performance.now() - started)} ms.`);
+        addDiagnostic(
+          `Preview closed in ${Math.round(performance.now() - started)} ms.`
+        );
         return true;
       }
     }
+
     setStatus('Transition blocked: Drive ignored the scripted close-button click.');
     addDiagnostic('Close timed out after 2 seconds.');
     return false;
@@ -353,21 +418,30 @@
     for (let attempt = 1; attempt <= 8; attempt += 1) {
       const rows = collectFolderRows();
       let item = rows.find(row => matchesTarget(row, target));
+
       if (item?.root?.isConnected && isVisible(item.root)) {
         if (!rowNeedsScroll(item.root)) {
-          addDiagnostic(`Resolved row immediately on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
+          addDiagnostic(
+            `Resolved row immediately on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`
+          );
           return item;
         }
+
         item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
         await sleep(90);
+
         item = collectFolderRows().find(row => matchesTarget(row, target));
         if (item?.root?.isConnected && isVisible(item.root)) {
-          addDiagnostic(`Resolved row after scroll on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
+          addDiagnostic(
+            `Resolved row after scroll on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`
+          );
           return item;
         }
       }
+
       await sleep(attempt < 4 ? 60 : 120);
     }
+
     addDiagnostic(`Row resolution failed: ${target.name}`);
     return null;
   }
@@ -375,32 +449,53 @@
   async function waitForPreview(target, timeoutMs = 5200) {
     const started = Date.now();
     let lastTitle = '';
+
     while (Date.now() - started < timeoutMs) {
       const evidence = getPreviewEvidence();
       if (evidence.titleName) lastTitle = evidence.titleName;
-      if (evidence.open && (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name))) {
+
+      if (
+        evidence.open &&
+        (!evidence.titleName ||
+          normalizeName(evidence.titleName) === normalizeName(target.name))
+      ) {
         return { ok: true, evidence };
       }
+
       await sleep(60);
     }
+
     return { ok: false, lastTitle };
   }
 
   async function tryOpenTarget(target, index, reason, attempt) {
     const live = await resolveFreshItem(target);
+
     if (!live?.root?.isConnected) {
       setStatus(`Transition failed: no fresh Drive row for ${target.name}`);
       return false;
     }
-    setStatus(`Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}): ${target.name}`);
+
+    setStatus(
+      `Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}): ${target.name}`
+    );
     addDiagnostic(`Open attempt ${attempt}: ${target.name}`);
     dispatchDoubleClick(live.root);
+
     const result = await waitForPreview(target, 5200);
     if (result.ok) {
-      addDiagnostic(`Preview confirmed: ${result.evidence.titleName || `(progress detected via ${result.evidence.progress?.source || 'unknown'})`}.`);
+      addDiagnostic(
+        `Preview confirmed: ${
+          result.evidence.titleName ||
+          `(progress detected via ${result.evidence.progress?.source || 'unknown'})`
+        }.`
+      );
       return true;
     }
-    addDiagnostic(`Open attempt ${attempt} timed out. Last preview title: ${result.lastTitle || '(none)'}.`);
+
+    addDiagnostic(
+      `Open attempt ${attempt} timed out. Last preview title: ${result.lastTitle || '(none)'}.`
+    );
     return false;
   }
 
@@ -412,40 +507,107 @@
     hiddenRangeLastMovementAt = 0;
   }
 
+  function cloneDetectedPlaylist() {
+    return detectedItems.map(item => ({
+      name: item.name,
+      id: item.id || ''
+    }));
+  }
+
+  function shuffleInPlace(items) {
+    for (let i = items.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [items[i], items[j]] = [items[j], items[i]];
+    }
+    return items;
+  }
+
+  function buildPlaylist() {
+    const built = cloneDetectedPlaylist();
+    if (shuffleMode) shuffleInPlace(built);
+    return built;
+  }
+
+  function toggleShuffle() {
+    shuffleMode = !shuffleMode;
+    updateShuffleButton();
+    renderPlaybackState(autoMode
+      ? 'Shuffle setting changed; applies on next Start'
+      : 'Ready');
+    addDiagnostic(
+      `Shuffle mode ${shuffleMode ? 'ON' : 'OFF'}${
+        autoMode ? '; current queue kept until next Start.' : '.'
+      }`
+    );
+    if (!autoMode) {
+      const previewQueue = buildPlaylist();
+      renderQueuePreview(previewQueue, -1);
+      setStatus(
+        shuffleMode
+          ? 'Shuffle is ON. Start playback to use a newly shuffled queue.'
+          : 'Shuffle is OFF. Start playback to use folder order.'
+      );
+    } else {
+      setStatus(
+        `Shuffle is now ${shuffleMode ? 'ON' : 'OFF'}; current queue is unchanged. Restart playback to rebuild it.`
+      );
+    }
+  }
+
   async function openPlaylistIndex(index, reason = 'manual') {
-    if (!playlist.length || advancing || index < 0 || index >= playlist.length) return false;
+    if (!playlist.length || advancing || index < 0 || index >= playlist.length) {
+      return false;
+    }
+
     advancing = true;
     resetProgressTracking();
     const transitionStarted = performance.now();
+
     try {
       const target = playlist[index];
       const previousIndex = currentIndex;
+
       if (getPreviewEvidence().open && !(await closePreview())) return false;
+
       let opened = await tryOpenTarget(target, index, reason, 1);
+
       if (!opened) {
         const evidence = getPreviewEvidence();
-        if (evidence.open && (!evidence.titleName || normalizeName(evidence.titleName) === normalizeName(target.name))) {
+        if (
+          evidence.open &&
+          (!evidence.titleName ||
+            normalizeName(evidence.titleName) === normalizeName(target.name))
+        ) {
           opened = true;
           addDiagnostic('Late preview detected after timeout; accepting transition.');
         }
       }
+
       if (!opened) {
         if (getPreviewEvidence().open) await closePreview();
         await sleep(120);
         opened = await tryOpenTarget(target, index, reason, 2);
       }
+
       if (!opened) {
         setStatus(`Transition failed: Drive preview did not open for ${target.name}`);
         currentIndex = previousIndex;
         renderPlaybackState('Transition failed; current index preserved');
-        addDiagnostic(`Transition failed; index remains ${previousIndex + 1}/${playlist.length}.`);
+        renderQueuePreview(playlist, currentIndex);
+        addDiagnostic(
+          `Transition failed; index remains ${previousIndex + 1}/${playlist.length}.`
+        );
         return false;
       }
+
       currentIndex = index;
       const elapsed = Math.round(performance.now() - transitionStarted);
       setStatus(`Playing ${index + 1}/${playlist.length}: ${target.name}`);
       renderPlaybackState(`Ready · transition ${elapsed} ms`);
-      addDiagnostic(`Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.`);
+      renderQueuePreview(playlist, currentIndex);
+      addDiagnostic(
+        `Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.`
+      );
       startMonitor();
       return true;
     } finally {
@@ -455,77 +617,127 @@
 
   async function startContinuousTest() {
     if (!detectedItems.length) scanCurrentView();
+
     if (!detectedItems.length) {
       setStatus('No media rows cached. Close preview, scan the folder, then retry.');
       return;
     }
+
     autoMode = true;
-    playlist = detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
+    playlistShuffled = shuffleMode;
+    playlist = buildPlaylist();
     currentIndex = -1;
     diagnosticHistory = [];
-    addDiagnostic(`Playlist captured: ${playlist.length}; ${playlist.filter(item => item.id).length} with stable Drive ids.`);
-    await openPlaylistIndex(0, 'start');
+    renderQueuePreview(playlist, currentIndex);
+
+    addDiagnostic(
+      `Playlist captured: ${playlist.length}; ${
+        playlist.filter(item => item.id).length
+      } with stable Drive ids; mode=${playlistShuffled ? 'shuffle' : 'ordered'}.`
+    );
+
+    if (playlistShuffled) {
+      addDiagnostic(
+        `Shuffle queue head: ${playlist.slice(0, 5).map(item => item.name).join(' | ')}`
+      );
+    }
+
+    await openPlaylistIndex(0, playlistShuffled ? 'shuffle start' : 'start');
   }
 
   function stopContinuousTest() {
     autoMode = false;
     resetProgressTracking();
+
     if (monitorTimer) {
       clearInterval(monitorTimer);
       monitorTimer = null;
     }
+
     setStatus('Continuous test stopped. Drive playback itself was left untouched.');
     renderPlaybackState('Stopped');
+    renderQueuePreview(playlist, currentIndex);
     addDiagnostic('Continuous test stopped.');
   }
 
   async function nextNow() {
-    if (!playlist.length) playlist = detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
+    if (!playlist.length) {
+      playlistShuffled = shuffleMode;
+      playlist = buildPlaylist();
+      renderQueuePreview(playlist, -1);
+    }
+
     if (!playlist.length) {
       setStatus('No cached media items. Scan the folder first.');
       return;
     }
+
     autoMode = true;
     const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+
     if (nextIndex >= playlist.length) {
       stopContinuousTest();
       setStatus('Reached the end of the cached test playlist.');
       return;
     }
+
     await openPlaylistIndex(nextIndex, 'Next now');
   }
 
   async function handleTrackEnd() {
     if (!autoMode || advancing || currentIndex < 0) return;
+
     endArmed = false;
     const nextIndex = currentIndex + 1;
+
     if (nextIndex >= playlist.length) {
       autoMode = false;
-      setStatus(`Cached playlist finished (${playlist.length} track(s)).`);
+      setStatus(
+        `${playlistShuffled ? 'Shuffled' : 'Cached'} playlist finished (${playlist.length} track(s)).`
+      );
       renderPlaybackState('Playlist finished');
+      renderQueuePreview(playlist, currentIndex);
       addDiagnostic('Playlist finished.');
       return;
     }
+
     setStatus(`End detected. Advancing to ${nextIndex + 1}/${playlist.length}…`);
-    addDiagnostic(`End inferred for track ${currentIndex + 1}; advancing.`);
+    addDiagnostic(
+      `End inferred for track ${currentIndex + 1}; advancing within ${
+        playlistShuffled ? 'shuffle' : 'ordered'
+      } queue.`
+    );
     await openPlaylistIndex(nextIndex, 'automatic next');
   }
 
   function monitorTick() {
     if (!autoMode || advancing || currentIndex < 0) return;
+
     const progress = getProgressState();
     if (!progress) {
       renderPlaybackState('Preview open; progress signal unavailable/hidden');
       return;
     }
+
     const ratio = progress.ratio;
     if (!endArmed && ratio < 0.95) endArmed = true;
+
     const percent = Math.round(ratio * 1000) / 10;
-    renderPlaybackState(`${percent}% · ${progress.source}${endArmed ? ' · armed' : ' · waiting reset'}`);
-    if (endArmed && ratio >= 0.995 && (lastRatio === null || lastRatio < 0.995)) {
+    renderPlaybackState(
+      `${percent}% · ${progress.source}${
+        endArmed ? ' · armed' : ' · waiting reset'
+      }`
+    );
+
+    if (
+      endArmed &&
+      ratio >= 0.995 &&
+      (lastRatio === null || lastRatio < 0.995)
+    ) {
       log(`Track end inferred from ${progress.source}.`, progress);
       void handleTrackEnd();
     }
+
     lastRatio = ratio;
   }
 
@@ -544,7 +756,10 @@
     const closeDesc = close
       ? `${close.tagName.toLowerCase()} label="${close.getAttribute('aria-label') || close.getAttribute('title') || '(none)'}"`
       : '(none)';
-    addDiagnostic(`Probe -> open=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`);
+
+    addDiagnostic(
+      `Probe -> open=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`
+    );
   }
 
   function setStatus(text) {
@@ -553,28 +768,86 @@
   }
 
   function addDiagnostic(text) {
-    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const stamp = new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+
     diagnosticHistory.push(`${stamp}  ${text}`);
     diagnosticHistory = diagnosticHistory.slice(-8);
+
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="diagnostic"]`);
     if (node) node.textContent = diagnosticHistory.join('\n');
+
     log(text);
+  }
+
+  function updateShuffleButton() {
+    const button = document.querySelector(`#${PANEL_ID} [data-gdfp="shuffle-toggle"]`);
+    if (!button) return;
+    button.textContent = `Shuffle: ${shuffleMode ? 'ON' : 'OFF'}`;
+    button.setAttribute('aria-pressed', String(shuffleMode));
+    button.style.background = shuffleMode
+      ? 'rgba(129,201,149,.22)'
+      : 'rgba(255,255,255,.11)';
   }
 
   function renderPlaybackState(detail = '') {
     const box = document.querySelector(`#${PANEL_ID} [data-gdfp="playback-status"]`);
     if (!box) return;
-    const name = currentIndex >= 0 && playlist[currentIndex] ? playlist[currentIndex].name : '—';
-    const position = currentIndex >= 0 && playlist.length ? `${currentIndex + 1}/${playlist.length}` : '—';
-    box.textContent = `Continuous: ${autoMode ? 'ON' : 'OFF'} | Track: ${position} | ${detail}\n${name}`;
+
+    const name =
+      currentIndex >= 0 && playlist[currentIndex]
+        ? playlist[currentIndex].name
+        : '—';
+
+    const position =
+      currentIndex >= 0 && playlist.length
+        ? `${currentIndex + 1}/${playlist.length}`
+        : '—';
+
+    box.textContent =
+      `Continuous: ${autoMode ? 'ON' : 'OFF'} | Mode: ${
+        (playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED'
+      } | Track: ${position} | ${detail}\n${name}`;
+  }
+
+  function renderQueuePreview(queue = playlist, activeIndex = currentIndex) {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="queue"]`);
+    if (!box) return;
+
+    if (!queue.length) {
+      box.textContent = 'Queue: not built yet.';
+      return;
+    }
+
+    const mode = (queue === playlist && playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED';
+    let start = activeIndex >= 0 ? activeIndex : 0;
+    if (start >= queue.length) start = Math.max(0, queue.length - 1);
+
+    const lines = [`Queue ${mode}: ${queue.length} track(s)`];
+    const end = Math.min(queue.length, start + 7);
+
+    for (let i = start; i < end; i += 1) {
+      lines.push(`${i === activeIndex ? '▶' : ' '} ${i + 1}. ${queue[i].name}`);
+    }
+
+    if (end < queue.length) {
+      lines.push(`… +${queue.length - end} later`);
+    }
+
+    box.textContent = lines.join('\n');
   }
 
   function renderResults() {
     const count = document.querySelector(`#${PANEL_ID} [data-gdfp="count"]`);
     const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
     if (!count || !list) return;
+
     count.textContent = `${detectedItems.length} cached visible media item(s)`;
     list.replaceChildren();
+
     for (const item of detectedItems.slice(0, 8)) {
       const row = document.createElement('div');
       row.textContent = item.name;
@@ -584,6 +857,7 @@
       row.style.textOverflow = 'ellipsis';
       list.appendChild(row);
     }
+
     if (detectedItems.length > 8) {
       const more = document.createElement('div');
       more.textContent = `… +${detectedItems.length - 8} more`;
@@ -592,10 +866,13 @@
     }
   }
 
-  function makeButton(label, handler) {
+  function makeButton(label, handler, dataRole = '') {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = label;
+
+    if (dataRole) button.dataset.gdfp = dataRole;
+
     Object.assign(button.style, {
       border: '1px solid rgba(255,255,255,.28)',
       borderRadius: '7px',
@@ -605,69 +882,143 @@
       cursor: 'pointer',
       font: 'inherit'
     });
+
     button.addEventListener('click', handler);
     return button;
   }
 
   function mountPanel() {
     if (document.getElementById(PANEL_ID)) return;
+
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
+
     Object.assign(panel.style, {
-      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647',
-      width: '410px', maxHeight: '78vh', overflow: 'auto', boxSizing: 'border-box',
-      padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)',
-      color: '#f1f3f4', boxShadow: '0 8px 30px rgba(0,0,0,.32)',
+      position: 'fixed',
+      right: '18px',
+      bottom: '18px',
+      zIndex: '2147483647',
+      width: '430px',
+      maxHeight: '82vh',
+      overflow: 'auto',
+      boxSizing: 'border-box',
+      padding: '12px',
+      borderRadius: '12px',
+      background: 'rgba(32,33,36,.97)',
+      color: '#f1f3f4',
+      boxShadow: '0 8px 30px rgba(0,0,0,.32)',
       font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
+
     const title = document.createElement('div');
     title.textContent = `Google Drive Folder Player — Probe ${VERSION}`;
     title.style.fontWeight = '650';
     title.style.marginBottom = '8px';
+
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Close preview, scan the music folder, then start the test.';
+    status.textContent =
+      'Ready. Scan the music folder, choose Shuffle if wanted, then start playback.';
     status.style.marginBottom = '9px';
+
     const controls = document.createElement('div');
-    Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
+    Object.assign(controls.style, {
+      display: 'flex',
+      gap: '7px',
+      flexWrap: 'wrap',
+      marginBottom: '9px'
+    });
+
     controls.append(
       makeButton('Scan folder view', scanCurrentView),
+      makeButton('Shuffle: OFF', toggleShuffle, 'shuffle-toggle'),
       makeButton('Start continuous test', startContinuousTest),
       makeButton('Next now', nextNow),
       makeButton('Stop', stopContinuousTest),
       makeButton('Probe transition', probeTransition)
     );
+
     const playback = document.createElement('div');
     playback.dataset.gdfp = 'playback-status';
-    playback.textContent = 'Continuous: OFF | Track: —';
+    playback.textContent =
+      'Continuous: OFF | Mode: ORDERED | Track: —';
+
     Object.assign(playback.style, {
-      marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
-      background: 'rgba(129,201,149,.12)', border: '1px solid rgba(129,201,149,.28)', overflowWrap: 'anywhere'
+      marginBottom: '9px',
+      padding: '8px',
+      borderRadius: '7px',
+      whiteSpace: 'pre-wrap',
+      background: 'rgba(129,201,149,.12)',
+      border: '1px solid rgba(129,201,149,.28)',
+      overflowWrap: 'anywhere'
     });
+
+    const queue = document.createElement('div');
+    queue.dataset.gdfp = 'queue';
+    queue.textContent = 'Queue: not built yet.';
+    Object.assign(queue.style, {
+      marginBottom: '9px',
+      padding: '8px',
+      borderRadius: '7px',
+      whiteSpace: 'pre-wrap',
+      background: 'rgba(251,188,4,.09)',
+      border: '1px solid rgba(251,188,4,.24)',
+      overflowWrap: 'anywhere',
+      fontSize: '11px'
+    });
+
     const diagnostic = document.createElement('div');
     diagnostic.dataset.gdfp = 'diagnostic';
     diagnostic.textContent = 'Transition history will appear here.';
     Object.assign(diagnostic.style, {
-      marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
-      background: 'rgba(138,180,248,.12)', border: '1px solid rgba(138,180,248,.28)', overflowWrap: 'anywhere',
+      marginBottom: '9px',
+      padding: '8px',
+      borderRadius: '7px',
+      whiteSpace: 'pre-wrap',
+      background: 'rgba(138,180,248,.12)',
+      border: '1px solid rgba(138,180,248,.28)',
+      overflowWrap: 'anywhere',
       fontSize: '11px'
     });
+
     const count = document.createElement('div');
     count.dataset.gdfp = 'count';
     count.textContent = 'Not scanned yet';
     count.style.fontWeight = '600';
     count.style.marginBottom = '5px';
+
     const list = document.createElement('div');
     list.dataset.gdfp = 'list';
-    Object.assign(list.style, { display: 'grid', gap: '2px' });
-    const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.10 integrates hidden WebM/video timeline detection directly into the main script and avoids mistaking Drive\'s right-side details pane for an open preview. Still @grant none; no Google API.';
-    Object.assign(note.style, {
-      marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)',
-      opacity: '0.65', fontSize: '11px'
+    Object.assign(list.style, {
+      display: 'grid',
+      gap: '2px'
     });
-    panel.append(title, status, controls, playback, diagnostic, count, list, note);
+
+    const note = document.createElement('div');
+    note.textContent =
+      'Probe 0.0.11 adds a Fisher–Yates shuffled queue on top of the validated 0.0.10 MP3/WebM continuous-playback core. Shuffle never repeats an item inside one queue; Repeat is not implemented yet. Still @grant none; no Google API.';
+    Object.assign(note.style, {
+      marginTop: '9px',
+      paddingTop: '8px',
+      borderTop: '1px solid rgba(255,255,255,.16)',
+      opacity: '0.65',
+      fontSize: '11px'
+    });
+
+    panel.append(
+      title,
+      status,
+      controls,
+      playback,
+      queue,
+      diagnostic,
+      count,
+      list,
+      note
+    );
+
     document.body.appendChild(panel);
+    updateShuffleButton();
     log(`Probe ${VERSION} mounted.`);
   }
 

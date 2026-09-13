@@ -12,6 +12,19 @@ All notable changes to this project will be documented here.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
 
+## [0.0.8] - 2026-09-13
+
+### Changed
+
+- Restore the broad folder-item discovery strategy that worked in 0.0.6: scan filename-bearing descendants (`span`, `aria-label`, `title`, etc.) and climb to their interactive Drive row/list/grid ancestor.
+- Keep the preview-title detection introduced in 0.0.7, but do not require the filename itself to live directly on a `role=row`, `role=listitem`, or `role=gridcell` node.
+- Continue excluding preview-header media text from folder scans while a preview is open.
+
+### Findings
+
+- 0.0.7 regressed folder scanning on the tested Edge/Drive layout: it returned `0 live row(s)` even though the same folder had produced 50 items in earlier probes.
+- The regression came from restricting discovery to row/list/grid nodes themselves. On this Drive layout, the media filename is exposed on descendant elements, so the row's own text/accessible attributes are not reliable enough for discovery.
+
 ## [0.0.7] - 2026-09-13
 
 ### Changed

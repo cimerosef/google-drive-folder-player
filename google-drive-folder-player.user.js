@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.11
-// @description  Continuous Google Drive media playback with an optional shuffled playback queue.
+// @version      0.0.12
+// @description  Continuous Google Drive media playback with Shuffle and Repeat Off/All/One.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,8 +13,9 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.11';
+  const VERSION = '0.0.12';
   const PANEL_ID = 'gdfp-probe-panel';
+  const REPEAT_MODES = ['off', 'all', 'one'];
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
     'webm', 'aiff', 'aif', 'm4b', 'mp4'
@@ -29,6 +30,7 @@
   let currentIndex = -1;
   let shuffleMode = false;
   let playlistShuffled = false;
+  let repeatMode = 'off';
   let autoMode = false;
   let advancing = false;
   let endArmed = false;
@@ -177,15 +179,18 @@
   function sampleHiddenProgressState() {
     const candidates = hiddenRangeCandidates();
     let changed = null;
+
     for (const state of candidates) {
       const previous = hiddenRangePrevious.get(state.input);
       if (previous !== undefined && state.now !== previous) changed = state;
       hiddenRangePrevious.set(state.input, state.now);
     }
+
     if (changed) {
       hiddenRangeActive = changed.input;
       hiddenRangeLastMovementAt = Date.now();
     }
+
     const active = candidates.find(state => state.input === hiddenRangeActive);
     if (!active) return null;
     if (Date.now() - hiddenRangeLastMovementAt > 1400) return null;
@@ -531,14 +536,19 @@
   function toggleShuffle() {
     shuffleMode = !shuffleMode;
     updateShuffleButton();
-    renderPlaybackState(autoMode
-      ? 'Shuffle setting changed; applies on next Start'
-      : 'Ready');
+
+    renderPlaybackState(
+      autoMode
+        ? 'Shuffle setting changed; applies on next Start'
+        : 'Ready'
+    );
+
     addDiagnostic(
       `Shuffle mode ${shuffleMode ? 'ON' : 'OFF'}${
         autoMode ? '; current queue kept until next Start.' : '.'
       }`
     );
+
     if (!autoMode) {
       const previewQueue = buildPlaylist();
       renderQueuePreview(previewQueue, -1);
@@ -551,6 +561,25 @@
       setStatus(
         `Shuffle is now ${shuffleMode ? 'ON' : 'OFF'}; current queue is unchanged. Restart playback to rebuild it.`
       );
+    }
+  }
+
+  function toggleRepeat() {
+    const index = REPEAT_MODES.indexOf(repeatMode);
+    repeatMode = REPEAT_MODES[(index + 1) % REPEAT_MODES.length];
+    updateRepeatButton();
+    renderPlaybackState('Repeat setting changed');
+    renderQueuePreview(playlist, currentIndex);
+
+    const label = repeatMode.toUpperCase();
+    addDiagnostic(`Repeat mode ${label}.`);
+
+    if (repeatMode === 'off') {
+      setStatus('Repeat is OFF. Playback stops at the end of the current queue.');
+    } else if (repeatMode === 'all') {
+      setStatus('Repeat ALL is ON. The current queue restarts from track 1 when it ends.');
+    } else {
+      setStatus('Repeat ONE is ON. A naturally finished track restarts itself.');
     }
   }
 
@@ -633,7 +662,7 @@
     addDiagnostic(
       `Playlist captured: ${playlist.length}; ${
         playlist.filter(item => item.id).length
-      } with stable Drive ids; mode=${playlistShuffled ? 'shuffle' : 'ordered'}.`
+      } with stable Drive ids; mode=${playlistShuffled ? 'shuffle' : 'ordered'}; repeat=${repeatMode}.`
     );
 
     if (playlistShuffled) {
@@ -673,12 +702,17 @@
     }
 
     autoMode = true;
-    const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+    let nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
 
     if (nextIndex >= playlist.length) {
-      stopContinuousTest();
-      setStatus('Reached the end of the cached test playlist.');
-      return;
+      if (repeatMode === 'all') {
+        nextIndex = 0;
+        addDiagnostic('Manual Next wrapped to track 1 because Repeat ALL is active.');
+      } else {
+        stopContinuousTest();
+        setStatus('Reached the end of the cached test playlist.');
+        return;
+      }
     }
 
     await openPlaylistIndex(nextIndex, 'Next now');
@@ -688,16 +722,36 @@
     if (!autoMode || advancing || currentIndex < 0) return;
 
     endArmed = false;
-    const nextIndex = currentIndex + 1;
+
+    if (repeatMode === 'one') {
+      setStatus(`End detected. Repeating track ${currentIndex + 1}/${playlist.length}…`);
+      addDiagnostic(
+        `End inferred for track ${currentIndex + 1}; Repeat ONE reopening same track.`
+      );
+      await openPlaylistIndex(currentIndex, 'repeat one');
+      return;
+    }
+
+    let nextIndex = currentIndex + 1;
 
     if (nextIndex >= playlist.length) {
+      if (repeatMode === 'all') {
+        nextIndex = 0;
+        setStatus(`End detected. Repeat ALL restarting the ${playlistShuffled ? 'shuffled' : 'ordered'} queue…`);
+        addDiagnostic(
+          `Queue end reached; Repeat ALL wrapping to track 1 without rebuilding the ${playlistShuffled ? 'shuffled' : 'ordered'} queue.`
+        );
+        await openPlaylistIndex(nextIndex, 'repeat all');
+        return;
+      }
+
       autoMode = false;
       setStatus(
         `${playlistShuffled ? 'Shuffled' : 'Cached'} playlist finished (${playlist.length} track(s)).`
       );
       renderPlaybackState('Playlist finished');
       renderQueuePreview(playlist, currentIndex);
-      addDiagnostic('Playlist finished.');
+      addDiagnostic('Playlist finished; Repeat OFF.');
       return;
     }
 
@@ -786,11 +840,28 @@
   function updateShuffleButton() {
     const button = document.querySelector(`#${PANEL_ID} [data-gdfp="shuffle-toggle"]`);
     if (!button) return;
+
     button.textContent = `Shuffle: ${shuffleMode ? 'ON' : 'OFF'}`;
     button.setAttribute('aria-pressed', String(shuffleMode));
     button.style.background = shuffleMode
       ? 'rgba(129,201,149,.22)'
       : 'rgba(255,255,255,.11)';
+  }
+
+  function updateRepeatButton() {
+    const button = document.querySelector(`#${PANEL_ID} [data-gdfp="repeat-toggle"]`);
+    if (!button) return;
+
+    const label = repeatMode.toUpperCase();
+    button.textContent = `Repeat: ${label}`;
+    button.setAttribute('aria-label', `Repeat mode ${label}. Click to cycle Off, All, One.`);
+    button.setAttribute('aria-pressed', String(repeatMode !== 'off'));
+    button.style.background =
+      repeatMode === 'off'
+        ? 'rgba(255,255,255,.11)'
+        : repeatMode === 'all'
+          ? 'rgba(138,180,248,.22)'
+          : 'rgba(196,181,253,.22)';
   }
 
   function renderPlaybackState(detail = '') {
@@ -810,7 +881,7 @@
     box.textContent =
       `Continuous: ${autoMode ? 'ON' : 'OFF'} | Mode: ${
         (playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED'
-      } | Track: ${position} | ${detail}\n${name}`;
+      } | Repeat: ${repeatMode.toUpperCase()} | Track: ${position} | ${detail}\n${name}`;
   }
 
   function renderQueuePreview(queue = playlist, activeIndex = currentIndex) {
@@ -818,15 +889,21 @@
     if (!box) return;
 
     if (!queue.length) {
-      box.textContent = 'Queue: not built yet.';
+      box.textContent = `Queue: not built yet. Repeat ${repeatMode.toUpperCase()}.`;
       return;
     }
 
-    const mode = (queue === playlist && playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED';
+    const mode =
+      (queue === playlist && playlist.length ? playlistShuffled : shuffleMode)
+        ? 'SHUFFLE'
+        : 'ORDERED';
+
     let start = activeIndex >= 0 ? activeIndex : 0;
     if (start >= queue.length) start = Math.max(0, queue.length - 1);
 
-    const lines = [`Queue ${mode}: ${queue.length} track(s)`];
+    const lines = [
+      `Queue ${mode}: ${queue.length} track(s) · Repeat ${repeatMode.toUpperCase()}`
+    ];
     const end = Math.min(queue.length, start + 7);
 
     for (let i = start; i < end; i += 1) {
@@ -898,8 +975,8 @@
       right: '18px',
       bottom: '18px',
       zIndex: '2147483647',
-      width: '430px',
-      maxHeight: '82vh',
+      width: '450px',
+      maxHeight: '84vh',
       overflow: 'auto',
       boxSizing: 'border-box',
       padding: '12px',
@@ -918,7 +995,7 @@
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
     status.textContent =
-      'Ready. Scan the music folder, choose Shuffle if wanted, then start playback.';
+      'Ready. Scan the music folder, choose Shuffle/Repeat if wanted, then start playback.';
     status.style.marginBottom = '9px';
 
     const controls = document.createElement('div');
@@ -932,6 +1009,7 @@
     controls.append(
       makeButton('Scan folder view', scanCurrentView),
       makeButton('Shuffle: OFF', toggleShuffle, 'shuffle-toggle'),
+      makeButton('Repeat: OFF', toggleRepeat, 'repeat-toggle'),
       makeButton('Start continuous test', startContinuousTest),
       makeButton('Next now', nextNow),
       makeButton('Stop', stopContinuousTest),
@@ -941,7 +1019,7 @@
     const playback = document.createElement('div');
     playback.dataset.gdfp = 'playback-status';
     playback.textContent =
-      'Continuous: OFF | Mode: ORDERED | Track: —';
+      'Continuous: OFF | Mode: ORDERED | Repeat: OFF | Track: —';
 
     Object.assign(playback.style, {
       marginBottom: '9px',
@@ -955,7 +1033,7 @@
 
     const queue = document.createElement('div');
     queue.dataset.gdfp = 'queue';
-    queue.textContent = 'Queue: not built yet.';
+    queue.textContent = 'Queue: not built yet. Repeat OFF.';
     Object.assign(queue.style, {
       marginBottom: '9px',
       padding: '8px',
@@ -996,7 +1074,7 @@
 
     const note = document.createElement('div');
     note.textContent =
-      'Probe 0.0.11 adds a Fisher–Yates shuffled queue on top of the validated 0.0.10 MP3/WebM continuous-playback core. Shuffle never repeats an item inside one queue; Repeat is not implemented yet. Still @grant none; no Google API.';
+      'Probe 0.0.12 adds Repeat OFF / ALL / ONE on top of the validated 0.0.11 shuffled queue and MP3/WebM continuous-playback core. Repeat ALL reuses the current queue order; Repeat ONE applies to natural track endings, while manual Next still skips forward. Still @grant none; no Google API.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',
@@ -1019,6 +1097,7 @@
 
     document.body.appendChild(panel);
     updateShuffleButton();
+    updateRepeatButton();
     log(`Probe ${VERSION} mounted.`);
   }
 

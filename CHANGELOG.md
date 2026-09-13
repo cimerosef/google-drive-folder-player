@@ -6,11 +6,24 @@ All notable changes to this project will be documented here.
 
 ### Planned
 
-- Identify a reliable DOM/UI route for playback state and track-end detection.
-- Add continuous playback.
+- Validate automatic next-track playback on Edge + Violentmonkey.
+- Expand folder discovery beyond currently cached/rendered rows.
 - Add shuffle.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
+
+## [0.0.4] - 2026-09-13
+
+### Added
+
+- Identify Drive's native progress slider from the preview controls without relying on language-specific labels.
+- Poll the progress slider and infer track end when playback reaches the end of the slider range.
+- Add a continuous-playback prototype that automatically closes the current Drive preview and opens the next cached audio row.
+- Add `Start continuous test`, `Next now`, and `Stop` controls plus a live playback-monitor status line.
+
+### Findings
+
+- Edge + Violentmonkey exposes a progress slider with a large numeric range (observed `0..1000`) and a separate volume slider (`0..100`), which gives the userscript a viable language-neutral route for playback progress and end detection.
 
 ## [0.0.3] - 2026-09-13
 

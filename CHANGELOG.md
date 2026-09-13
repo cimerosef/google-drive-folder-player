@@ -12,6 +12,20 @@ All notable changes to this project will be documented here.
 - Add Repeat Off / All / One.
 - Validate Chrome, Firefox, and Safari compatibility.
 
+## [0.0.5] - 2026-09-13
+
+### Changed
+
+- Replace the synthetic `Escape` transition with a click on Drive's real visible preview close control before opening the next cached row.
+- Add a language-independent geometric fallback for locating the top-left close control when its accessible label is unavailable.
+- Add a `Probe transition` diagnostic showing the progress slider and the close-control candidate.
+- Improve transition status messages so failures distinguish between close-control detection, ignored close clicks, stale cached rows, and preview-open failures.
+
+### Findings
+
+- `Next now` in 0.0.4 did not switch tracks on Edge; the first track continued playing.
+- The most likely failure point is the synthetic Escape key event used to close Drive's preview. Script-generated keyboard events are not guaranteed to be treated like trusted user key presses by Drive.
+
 ## [0.0.4] - 2026-09-13
 
 ### Added

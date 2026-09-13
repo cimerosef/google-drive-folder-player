@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.12
-// @description  Continuous Google Drive media playback with Shuffle and Repeat Off/All/One.
+// @version      0.0.13
+// @description  Continuous Google Drive media playback with Shuffle, Repeat, and a draggable control panel.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.12';
+  const VERSION = '0.0.13';
   const PANEL_ID = 'gdfp-probe-panel';
   const REPEAT_MODES = ['off', 'all', 'one'];
   const MEDIA_EXTENSIONS = [
@@ -964,6 +964,86 @@
     return button;
   }
 
+  function clampPanelPosition(panel, left, top) {
+    const margin = 4;
+    const maxLeft = Math.max(margin, window.innerWidth - panel.offsetWidth - margin);
+    const maxTop = Math.max(margin, window.innerHeight - panel.offsetHeight - margin);
+    return {
+      left: Math.min(maxLeft, Math.max(margin, left)),
+      top: Math.min(maxTop, Math.max(margin, top))
+    };
+  }
+
+  function enablePanelDragging(panel, handle) {
+    let dragging = false;
+    let pointerId = null;
+    let offsetX = 0;
+    let offsetY = 0;
+    let previousBodyUserSelect = '';
+
+    const finishDrag = event => {
+      if (!dragging || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
+      dragging = false;
+      handle.style.cursor = 'grab';
+      if (document.body) document.body.style.userSelect = previousBodyUserSelect;
+      try {
+        if (pointerId !== null && handle.hasPointerCapture?.(pointerId)) {
+          handle.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // Ignore capture-release races.
+      }
+      pointerId = null;
+    };
+
+    handle.addEventListener('pointerdown', event => {
+      if (!event.isPrimary || event.button !== 0) return;
+      const rect = panel.getBoundingClientRect();
+      offsetX = event.clientX - rect.left;
+      offsetY = event.clientY - rect.top;
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.dataset.gdfpDragged = 'true';
+      dragging = true;
+      pointerId = event.pointerId;
+      handle.style.cursor = 'grabbing';
+      previousBodyUserSelect = document.body?.style.userSelect || '';
+      if (document.body) document.body.style.userSelect = 'none';
+      try {
+        handle.setPointerCapture?.(event.pointerId);
+      } catch {
+        // Pointer capture is an optimization; dragging still works without it.
+      }
+      event.preventDefault();
+    });
+
+    handle.addEventListener('pointermove', event => {
+      if (!dragging || event.pointerId !== pointerId) return;
+      const position = clampPanelPosition(
+        panel,
+        event.clientX - offsetX,
+        event.clientY - offsetY
+      );
+      panel.style.left = `${position.left}px`;
+      panel.style.top = `${position.top}px`;
+      event.preventDefault();
+    });
+
+    handle.addEventListener('pointerup', finishDrag);
+    handle.addEventListener('pointercancel', finishDrag);
+    handle.addEventListener('lostpointercapture', finishDrag);
+
+    window.addEventListener('resize', () => {
+      if (panel.dataset.gdfpDragged !== 'true') return;
+      const rect = panel.getBoundingClientRect();
+      const position = clampPanelPosition(panel, rect.left, rect.top);
+      panel.style.left = `${position.left}px`;
+      panel.style.top = `${position.top}px`;
+    });
+  }
+
   function mountPanel() {
     if (document.getElementById(PANEL_ID)) return;
 
@@ -989,8 +1069,14 @@
 
     const title = document.createElement('div');
     title.textContent = `Google Drive Folder Player — Probe ${VERSION}`;
-    title.style.fontWeight = '650';
-    title.style.marginBottom = '8px';
+    title.title = 'Drag this title bar to move the panel';
+    Object.assign(title.style, {
+      fontWeight: '650',
+      marginBottom: '8px',
+      cursor: 'grab',
+      userSelect: 'none',
+      touchAction: 'none'
+    });
 
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
@@ -1074,7 +1160,7 @@
 
     const note = document.createElement('div');
     note.textContent =
-      'Probe 0.0.12 adds Repeat OFF / ALL / ONE on top of the validated 0.0.11 shuffled queue and MP3/WebM continuous-playback core. Repeat ALL reuses the current queue order; Repeat ONE applies to natural track endings, while manual Next still skips forward. Still @grant none; no Google API.';
+      'Probe 0.0.13 keeps the validated 0.0.12 Shuffle + Repeat + MP3/WebM playback core and makes this panel draggable by its title bar. Dragging is viewport-clamped and is intentionally not persisted after refresh. Still @grant none; no Google API.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',
@@ -1096,6 +1182,7 @@
     );
 
     document.body.appendChild(panel);
+    enablePanelDragging(panel, title);
     updateShuffleButton();
     updateRepeatButton();
     log(`Probe ${VERSION} mounted.`);

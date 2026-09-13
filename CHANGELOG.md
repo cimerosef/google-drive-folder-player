@@ -6,19 +6,44 @@ All notable changes to this project will be documented here.
 
 ### Planned
 
-- Validate whether the changing hidden WebM playback input exposes language-neutral native `value` / `min` / `max` fields suitable for end detection.
-- Expand folder discovery beyond currently cached/rendered rows.
-- Add shuffle.
 - Add Repeat Off / All / One.
+- Expand folder discovery beyond currently cached/rendered rows.
 - Validate Chrome, Firefox, and Safari compatibility.
+
+## [0.0.11] - 2026-09-13
+
+### Added
+
+- Add an optional shuffled playback queue built with Fisher–Yates from the currently cached media items.
+- Add a `Shuffle: ON/OFF` control and an amber queue preview showing the fixed playback order.
+- Keep the active queue stable during playback; toggling Shuffle only affects the next Start.
 
 ### Findings
 
-- The first hidden-progress probe found multiple stale/hidden progress-style controls with `aria-valuenow=0`; those controls did not change during playback and are not useful for end detection.
-- The second playback-state probe found two live changing signals while a WebM/video was playing with Drive controls hidden.
-- One live signal is an `input` element whose `aria-valuetext` advanced from `18 secondes sur 4 minutes 14 secondes` to `28 secondes sur 4 minutes 14 secondes` while remaining hidden.
-- A second live signal is a time-text element advancing from `0:18` to `0:28`.
-- This proves Drive retains a live playback-time signal even when the visible transport controls disappear. The preferred implementation path is now to use the underlying input's native numeric fields if available, because that would be language-independent; localized `aria-valuetext` / clock text remain fallbacks.
+- Edge + Violentmonkey validation passed with the shuffled queue enabled.
+- Repeated `Next now` actions followed the displayed randomized queue correctly.
+- Automatic end-of-track advance also followed the next item in the same shuffled queue.
+- MP3/WebM mixed-media playback remained functional.
+- Transition responsiveness remained comparable to the validated 0.0.9/0.0.10 path.
+- Shuffle itself introduces no repeats; Repeat remains a separate feature.
+
+## [0.0.10] - 2026-09-13
+
+### Added
+
+- Integrate language-independent WebM/video progress detection using Drive's live hidden native `input[type="range"]` timeline.
+- Preserve ordinary visible-slider progress detection for audio previews.
+
+### Changed
+
+- Avoid mistaking Google Drive's right-side Details/Information pane for an active media preview.
+- Keep the 0.0.9 transition path and performance characteristics while supporting hidden WebM/video controls.
+
+### Findings
+
+- Edge + Violentmonkey confirmed MP3 -> WebM transition, hidden WebM progress tracking, WebM natural end detection, and automatic next-track playback.
+- Keeping the right-side Details pane open no longer blocked preview transitions.
+- The continuous-playback core is validated on Edge for currently discovered/cached media items.
 
 ## [0.0.9] - 2026-09-13
 

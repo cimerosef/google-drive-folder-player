@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.2
-// @description  Probe Google Drive audio folders, Drive preview playback, and end-of-track events.
+// @version      0.0.3
+// @description  Probe Google Drive audio folders and inspect Drive's native preview controls without privileged APIs.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.2';
+  const VERSION = '0.0.3';
   const PANEL_ID = 'gdfp-probe-panel';
   const AUDIO_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
@@ -25,11 +25,13 @@
   );
 
   let detectedItems = [];
-  let activeMedia = null;
-  const observedMedia = new WeakSet();
 
   function log(...args) {
     console.log('[GDFP Probe]', ...args);
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   function isVisible(element) {
@@ -37,7 +39,11 @@
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return false;
     const style = getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden';
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0;
+  }
+
+  function isInsideOurPanel(element) {
+    return Boolean(element.closest?.(`#${PANEL_ID}`));
   }
 
   function extractAudioName(element) {
@@ -61,8 +67,9 @@
     let node = element;
     let fallback = element;
 
-    for (let depth = 0; node && depth < 9; depth += 1, node = node.parentElement) {
+    for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
       if (!(node instanceof Element)) break;
+      if (isInsideOurPanel(node)) break;
 
       const role = node.getAttribute('role');
       if (role === 'row' || role === 'listitem') return node;
@@ -73,9 +80,47 @@
     return fallback;
   }
 
+  function looksLikePreview(element) {
+    if (!(element instanceof Element) || !isVisible(element)) return false;
+    const text = (element.innerText || element.textContent || '').slice(0, 4000);
+    return AUDIO_RE.test(text) || Boolean(element.querySelector('[role="slider"], [role="progressbar"], input[type="range"], [aria-valuenow]'));
+  }
+
+  function getPreviewRoots() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"]')]
+      .filter(element => !isInsideOurPanel(element) && looksLikePreview(element));
+
+    if (dialogs.length) return dialogs;
+
+    // Google occasionally renders preview controls without role="dialog".
+    const sliders = [...document.querySelectorAll('[role="slider"], input[type="range"]')]
+      .filter(element => !isInsideOurPanel(element) && isVisible(element));
+
+    const roots = [];
+    for (const slider of sliders) {
+      let node = slider;
+      for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+        if (!(node instanceof Element)) break;
+        const rect = node.getBoundingClientRect();
+        if (rect.width > 420 && rect.height > 220) {
+          roots.push(node);
+          break;
+        }
+      }
+    }
+    return [...new Set(roots)];
+  }
+
+  function previewIsOpen() {
+    return getPreviewRoots().length > 0;
+  }
+
+  function isInPreview(element) {
+    return getPreviewRoots().some(root => root.contains(element));
+  }
+
   function scanCurrentView() {
-    const main = document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
-    const candidates = main.querySelectorAll(
+    const candidates = document.querySelectorAll(
       '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
     );
 
@@ -84,11 +129,13 @@
     const results = [];
 
     for (const element of candidates) {
+      if (isInsideOurPanel(element) || isInPreview(element)) continue;
+
       const name = extractAudioName(element);
       if (!name) continue;
 
       const root = findItemRoot(element);
-      if (!isVisible(root)) continue;
+      if (!root || !isVisible(root) || isInPreview(root)) continue;
 
       const rect = root.getBoundingClientRect();
       const key = `${name.toLowerCase()}::${Math.round(rect.top)}::${Math.round(rect.left)}`;
@@ -99,10 +146,25 @@
       results.push({ name, root });
     }
 
-    detectedItems = results;
-    log(`Detected ${results.length} visible audio item(s).`, results.map(item => item.name));
+    if (results.length) {
+      detectedItems = results;
+      log(`Detected ${results.length} visible audio item(s).`, results.map(item => item.name));
+      renderResults();
+      setStatus(
+        previewIsOpen()
+          ? `Scan found ${results.length} folder item(s) while Drive preview is open. You can close the preview or test again.`
+          : 'Scan finished. If the filenames look correct, test opening the first audio file.'
+      );
+      return results;
+    }
+
     renderResults();
-    return results;
+    if (previewIsOpen()) {
+      setStatus('Drive preview is open and no folder rows were found. Close the preview with Esc, then press Scan. The previous scan is kept.');
+    } else {
+      setStatus('Scan finished. No visible audio file detected. Scroll the Drive folder so audio rows are rendered, then scan again.');
+    }
+    return [];
   }
 
   function dispatchDoubleClick(element) {
@@ -126,131 +188,129 @@
     element.dispatchEvent(new MouseEvent('dblclick', { ...common, detail: 2 }));
   }
 
-  function collectMediaElements(doc = document, depth = 0) {
-    const media = [...doc.querySelectorAll('audio, video')];
-    if (depth >= 2) return media;
-
-    for (const frame of doc.querySelectorAll('iframe')) {
-      try {
-        if (frame.contentDocument) {
-          media.push(...collectMediaElements(frame.contentDocument, depth + 1));
-        }
-      } catch {
-        // Cross-origin frame; ignore it in the probe.
-      }
-    }
-
-    return [...new Set(media)];
+  function dispatchEscape() {
+    const target = document.activeElement || document.body || document.documentElement;
+    const options = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    target.dispatchEvent(new KeyboardEvent('keydown', options));
+    target.dispatchEvent(new KeyboardEvent('keyup', options));
   }
 
-  function formatTime(seconds) {
-    if (!Number.isFinite(seconds) || seconds < 0) return '?';
-    const rounded = Math.floor(seconds);
-    const mins = Math.floor(rounded / 60);
-    const secs = String(rounded % 60).padStart(2, '0');
-    return `${mins}:${secs}`;
-  }
+  async function closePreviewIfNeeded() {
+    if (!previewIsOpen()) return true;
 
-  function describeMedia(media) {
-    if (!media) return 'No HTML audio/video element detected.';
-    return `${media.tagName.toLowerCase()} | ${media.paused ? 'paused' : 'playing'} | ${formatTime(media.currentTime)} / ${formatTime(media.duration)} | ended=${media.ended}`;
-  }
+    setStatus('A Drive preview is already open. Trying to close it before the test…');
+    dispatchEscape();
 
-  function updateMediaStatus(prefix = '') {
-    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="media-status"]`);
-    if (!box) return;
-    box.textContent = `${prefix}${prefix ? ' — ' : ''}${describeMedia(activeMedia)}`;
-
-    const seek = document.querySelector(`#${PANEL_ID} [data-gdfp="seek-end"]`);
-    if (seek) {
-      seek.disabled = !(activeMedia && Number.isFinite(activeMedia.duration) && activeMedia.duration > 4);
-      seek.style.opacity = seek.disabled ? '0.45' : '1';
-    }
-  }
-
-  function attachMediaDiagnostics(media) {
-    activeMedia = media;
-    if (observedMedia.has(media)) {
-      updateMediaStatus('Media detected');
-      return;
+    for (let i = 0; i < 8; i += 1) {
+      await sleep(150);
+      if (!previewIsOpen()) return true;
     }
 
-    observedMedia.add(media);
-    log('Attaching media diagnostics:', media);
-
-    const refresh = event => {
-      activeMedia = media;
-      updateMediaStatus(event.type);
-      log(`Media event: ${event.type}`, {
-        paused: media.paused,
-        ended: media.ended,
-        currentTime: media.currentTime,
-        duration: media.duration,
-        readyState: media.readyState
-      });
-    };
-
-    for (const type of ['loadedmetadata', 'durationchange', 'play', 'pause', 'ended', 'error']) {
-      media.addEventListener(type, refresh, true);
-    }
-
-    media.addEventListener('timeupdate', () => {
-      if (activeMedia === media) updateMediaStatus('timeupdate');
-    }, true);
-
-    updateMediaStatus('Media detected');
+    setStatus('Drive preview is still open. Close it manually with Esc or the × button, then press Scan and test again.');
+    return false;
   }
 
-  async function probePlayer(timeoutMs = 8000) {
-    setMediaStatus('Looking for Google Drive HTML audio/video element…');
-    const started = Date.now();
-
-    while (Date.now() - started < timeoutMs) {
-      const media = collectMediaElements();
-      if (media.length) {
-        const candidate = media.find(el => !el.paused || el.currentTime > 0) || media[0];
-        attachMediaDiagnostics(candidate);
-        setStatus(`Player probe succeeded: ${media.length} HTML media element(s) detected.`);
-        return candidate;
-      }
-      await new Promise(resolve => setTimeout(resolve, 250));
+  function findCurrentItemByName(name) {
+    const lower = name.toLowerCase();
+    if (detectedItems.length) {
+      const live = detectedItems.find(item => item.name.toLowerCase() === lower && item.root?.isConnected && isVisible(item.root));
+      if (live) return live;
     }
 
-    activeMedia = null;
-    setMediaStatus('No HTML audio/video element detected after 8 seconds. The Drive preview can still be controlled through another DOM/UI route.');
-    setStatus('Drive preview may be open, but no directly accessible HTML media element was found.');
-    return null;
+    scanCurrentView();
+    return detectedItems.find(item => item.name.toLowerCase() === lower && item.root?.isConnected) || null;
   }
 
   async function testFirstAudio() {
     if (!detectedItems.length) scanCurrentView();
 
-    const first = detectedItems[0];
-    if (!first) {
-      setStatus('No visible audio file detected. Scroll the Drive folder so audio files are visible, then press Scan.');
+    const original = detectedItems[0];
+    if (!original) {
+      setStatus('No folder audio item is available. Close any preview, then press Scan first.');
       return;
     }
 
-    setStatus(`Opening: ${first.name}`);
-    setMediaStatus('Waiting for Drive preview…');
+    if (!(await closePreviewIfNeeded())) return;
+
+    const first = findCurrentItemByName(original.name) || detectedItems[0];
+    if (!first?.root?.isConnected) {
+      setStatus('The first scanned row is no longer available. Press Scan again, then retry.');
+      return;
+    }
+
+    setStatus(`Opening with Drive preview: ${first.name}`);
+    setUiStatus('Waiting for Drive preview controls…');
     log('Testing Drive open action for:', first.name, first.root);
     dispatchDoubleClick(first.root);
 
-    await new Promise(resolve => setTimeout(resolve, 500));
-    await probePlayer(8000);
+    await sleep(1200);
+    if (previewIsOpen()) {
+      setStatus('Drive preview opened. Now probe its native UI controls.');
+      probePreviewUi();
+    } else {
+      setStatus('The double-click was sent, but a Drive preview was not detected. Try the test once more after a fresh Scan.');
+      setUiStatus('Preview not detected yet.');
+    }
   }
 
-  function seekNearEnd() {
-    if (!activeMedia || !Number.isFinite(activeMedia.duration) || activeMedia.duration <= 4) {
-      setMediaStatus('Cannot seek: no media with a known duration is currently available.');
-      return;
+  function compactText(value, max = 72) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  }
+
+  function describeControl(element) {
+    const tag = element.tagName.toLowerCase();
+    const role = element.getAttribute('role') || '';
+    const label = compactText(element.getAttribute('aria-label'));
+    const title = compactText(element.getAttribute('title'));
+    const text = compactText(element.textContent, 48);
+    const valueNow = element.getAttribute('aria-valuenow');
+    const valueMin = element.getAttribute('aria-valuemin');
+    const valueMax = element.getAttribute('aria-valuemax');
+    const valueText = compactText(element.getAttribute('aria-valuetext'));
+
+    const parts = [`<${tag}>`];
+    if (role) parts.push(`role=${role}`);
+    if (label) parts.push(`label="${label}"`);
+    else if (title) parts.push(`title="${title}"`);
+    else if (text) parts.push(`text="${text}"`);
+    if (valueNow !== null) parts.push(`value=${valueNow}${valueMin !== null && valueMax !== null ? ` [${valueMin}..${valueMax}]` : ''}`);
+    if (valueText) parts.push(`valueText="${valueText}"`);
+    return parts.join(' | ');
+  }
+
+  function probePreviewUi() {
+    const roots = getPreviewRoots();
+    const root = roots[0];
+
+    if (!root) {
+      setUiStatus('No Drive preview root detected. Open an audio preview first, then press “Probe preview UI”.');
+      setStatus('Preview UI probe could not find an open Drive preview.');
+      return [];
     }
 
-    const target = Math.max(0, activeMedia.duration - 3);
-    activeMedia.currentTime = target;
-    activeMedia.play().catch(error => log('play() after seek was rejected:', error));
-    updateMediaStatus('Seeked to final 3 seconds');
-    setStatus('End-event test armed. Wait a few seconds and watch the player probe line for “ended”.');
+    const selectors = [
+      'button', '[role="button"]', '[role="slider"]', '[role="progressbar"]',
+      'input[type="range"]', '[aria-valuenow]'
+    ].join(', ');
+
+    const controls = [...root.querySelectorAll(selectors)]
+      .filter(element => isVisible(element) && !isInsideOurPanel(element));
+
+    const descriptions = [...new Set(controls.map(describeControl))].slice(0, 18);
+
+    // Also capture visible time-like labels (e.g. 0:00 / 3:42), which may be plain spans.
+    const timeTexts = [...root.querySelectorAll('span, div')]
+      .filter(element => isVisible(element) && !element.children.length)
+      .map(element => compactText(element.textContent, 30))
+      .filter(text => /^(?:\d{1,2}:)?\d{1,2}:\d{2}$|^\d{1,2}:\d{2}$/.test(text))
+      .slice(0, 6);
+
+    renderUiResults(descriptions, timeTexts);
+    setStatus(`Preview UI probe found ${controls.length} visible control candidate(s).`);
+    log('Preview UI controls:', controls, descriptions, 'time labels:', timeTexts);
+    return controls;
   }
 
   function setStatus(text) {
@@ -258,9 +318,41 @@
     if (status) status.textContent = text;
   }
 
-  function setMediaStatus(text) {
-    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="media-status"]`);
+  function setUiStatus(text) {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="ui-status"]`);
     if (box) box.textContent = text;
+  }
+
+  function renderUiResults(descriptions = [], timeTexts = []) {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="ui-status"]`);
+    if (!box) return;
+
+    box.replaceChildren();
+
+    const heading = document.createElement('div');
+    heading.textContent = descriptions.length
+      ? `Preview controls detected (${descriptions.length} shown):`
+      : 'Preview detected, but no standard button/slider controls were found.';
+    heading.style.fontWeight = '600';
+    heading.style.marginBottom = '4px';
+    box.appendChild(heading);
+
+    for (const description of descriptions) {
+      const line = document.createElement('div');
+      line.textContent = description;
+      line.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+      line.style.fontSize = '11px';
+      line.style.marginTop = '2px';
+      line.style.overflowWrap = 'anywhere';
+      box.appendChild(line);
+    }
+
+    if (timeTexts.length) {
+      const line = document.createElement('div');
+      line.textContent = `Time text: ${[...new Set(timeTexts)].join(' · ')}`;
+      line.style.marginTop = '5px';
+      box.appendChild(line);
+    }
   }
 
   function renderResults() {
@@ -268,19 +360,18 @@
     const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
     if (!count || !list) return;
 
-    count.textContent = `${detectedItems.length} visible audio item(s)`;
+    count.textContent = `${detectedItems.length} cached visible audio item(s)`;
     list.replaceChildren();
 
     if (!detectedItems.length) {
       const empty = document.createElement('div');
-      empty.textContent = 'No audio filename detected in the currently rendered Drive items.';
+      empty.textContent = 'No folder audio rows cached yet.';
       empty.style.opacity = '0.72';
       list.appendChild(empty);
-      setStatus('Scan finished. No visible audio file detected.');
       return;
     }
 
-    for (const item of detectedItems.slice(0, 12)) {
+    for (const item of detectedItems.slice(0, 10)) {
       const row = document.createElement('div');
       row.textContent = item.name;
       row.title = item.name;
@@ -290,21 +381,18 @@
       list.appendChild(row);
     }
 
-    if (detectedItems.length > 12) {
+    if (detectedItems.length > 10) {
       const more = document.createElement('div');
-      more.textContent = `… +${detectedItems.length - 12} more`;
+      more.textContent = `… +${detectedItems.length - 10} more`;
       more.style.opacity = '0.72';
       list.appendChild(more);
     }
-
-    setStatus('Scan finished. If the filenames look correct, test opening the first audio file.');
   }
 
-  function createButton(label, onClick, dataKey = '') {
+  function createButton(label, onClick) {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = label;
-    if (dataKey) button.dataset.gdfp = dataKey;
     Object.assign(button.style, {
       border: '1px solid rgba(255,255,255,.28)',
       borderRadius: '7px',
@@ -328,27 +416,16 @@
       right: '18px',
       bottom: '18px',
       zIndex: '2147483647',
-      width: '340px',
-      maxHeight: '62vh',
+      width: '370px',
+      maxHeight: '72vh',
       overflow: 'auto',
       boxSizing: 'border-box',
       padding: '12px',
       borderRadius: '12px',
-      background: 'rgba(32, 33, 36, .96)',
+      background: 'rgba(32, 33, 36, .97)',
       color: '#f1f3f4',
       boxShadow: '0 8px 30px rgba(0,0,0,.32)',
       font: '13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
-    });
-
-    const header = document.createElement('div');
-    Object.assign(header.style, {
-      position: 'sticky',
-      top: '-12px',
-      zIndex: '2',
-      margin: '-12px -12px 9px',
-      padding: '12px',
-      background: 'rgba(32, 33, 36, .985)',
-      borderBottom: '1px solid rgba(255,255,255,.12)'
     });
 
     const title = document.createElement('div');
@@ -358,33 +435,26 @@
 
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Open a Google Drive folder containing audio files, then press Scan.';
+    status.textContent = 'Ready. Close any Drive preview, open a music folder, then press Scan.';
     status.style.marginBottom = '9px';
 
     const controls = document.createElement('div');
     Object.assign(controls.style, {
       display: 'flex',
       gap: '7px',
-      flexWrap: 'wrap'
+      flexWrap: 'wrap',
+      marginBottom: '9px'
     });
-
-    const seekButton = createButton('Skip to last 3s', seekNearEnd, 'seek-end');
-    seekButton.disabled = true;
-    seekButton.style.opacity = '0.45';
-
     controls.append(
-      createButton('Scan', scanCurrentView),
+      createButton('Scan folder view', scanCurrentView),
       createButton('Test first audio', testFirstAudio),
-      createButton('Probe player', () => probePlayer(8000)),
-      seekButton
+      createButton('Probe preview UI', probePreviewUi)
     );
 
-    header.append(title, status, controls);
-
-    const mediaBox = document.createElement('div');
-    mediaBox.dataset.gdfp = 'media-status';
-    mediaBox.textContent = 'Player probe: not run yet.';
-    Object.assign(mediaBox.style, {
+    const uiBox = document.createElement('div');
+    uiBox.dataset.gdfp = 'ui-status';
+    uiBox.textContent = 'Preview UI probe: not run yet.';
+    Object.assign(uiBox.style, {
       marginBottom: '9px',
       padding: '8px',
       borderRadius: '7px',
@@ -408,7 +478,7 @@
     });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe only: folder scanning currently sees rendered Drive items. Version 0.0.2 also tests whether Drive exposes a controllable HTML media element and a native ended event.';
+    note.textContent = 'Probe 0.0.3 separates folder rows from the open preview and inspects Drive’s own visible controls. It still uses @grant none and no Google API.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',
@@ -417,7 +487,7 @@
       fontSize: '11px'
     });
 
-    panel.append(header, mediaBox, count, list, note);
+    panel.append(title, status, controls, uiBox, count, list, note);
     document.body.appendChild(panel);
     log(`Probe ${VERSION} mounted.`, location.href);
   }

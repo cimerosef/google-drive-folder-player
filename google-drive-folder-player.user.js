@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.13
-// @description  Continuous Google Drive media playback with Shuffle, Repeat, and a draggable control panel.
+// @version      0.0.14
+// @description  Continuous Google Drive media playback with guarded background-tab transitions.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.13';
+  const VERSION = '0.0.14';
   const PANEL_ID = 'gdfp-probe-panel';
   const REPEAT_MODES = ['off', 'all', 'one'];
   const MEDIA_EXTENSIONS = [
@@ -37,6 +37,7 @@
   let monitorTimer = null;
   let lastRatio = null;
   let diagnosticHistory = [];
+  let backgroundCloseUnconfirmed = false;
 
   let hiddenRangePrevious = new WeakMap();
   let hiddenRangeActive = null;
@@ -375,7 +376,7 @@
     element.dispatchEvent(new MouseEvent('dblclick', { ...common, detail: 2 }));
   }
 
-  async function closePreview() {
+  async function closePreview(allowHiddenFallback = false) {
     const before = getPreviewEvidence();
     if (!before.open) return true;
 
@@ -403,8 +404,17 @@
       }
     }
 
-    setStatus('Transition blocked: Drive ignored the scripted close-button click.');
-    addDiagnostic('Close timed out after 2 seconds.');
+    if (allowHiddenFallback && document.hidden) {
+      backgroundCloseUnconfirmed = true;
+      setStatus('Background transition: preview close not yet confirmed; continuing with guarded next-track check.');
+      addDiagnostic(
+        'Close confirmation timed out while hidden; continuing only with positive target-title confirmation.'
+      );
+      return true;
+    }
+
+    setStatus('Transition blocked: preview close was not confirmed within the retry window.');
+    addDiagnostic('Close confirmation timed out.');
     return false;
   }
 
@@ -419,8 +429,10 @@
     return rect.top < 120 || rect.bottom > window.innerHeight - 24;
   }
 
-  async function resolveFreshItem(target) {
-    for (let attempt = 1; attempt <= 8; attempt += 1) {
+  async function resolveFreshItem(target, patient = false) {
+    const maxAttempts = patient ? 18 : 8;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const rows = collectFolderRows();
       let item = rows.find(row => matchesTarget(row, target));
 
@@ -433,7 +445,7 @@
         }
 
         item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
-        await sleep(90);
+        await sleep(patient ? 300 : 90);
 
         item = collectFolderRows().find(row => matchesTarget(row, target));
         if (item?.root?.isConnected && isVisible(item.root)) {
@@ -444,14 +456,18 @@
         }
       }
 
-      await sleep(attempt < 4 ? 60 : 120);
+      if (patient) {
+        await sleep(attempt < 6 ? 180 : 350);
+      } else {
+        await sleep(attempt < 4 ? 60 : 120);
+      }
     }
 
     addDiagnostic(`Row resolution failed: ${target.name}`);
     return null;
   }
 
-  async function waitForPreview(target, timeoutMs = 5200) {
+  async function waitForPreview(target, timeoutMs = 5200, requireTargetTitle = false) {
     const started = Date.now();
     let lastTitle = '';
 
@@ -459,22 +475,26 @@
       const evidence = getPreviewEvidence();
       if (evidence.titleName) lastTitle = evidence.titleName;
 
+      const titleMatches = Boolean(evidence.titleName) &&
+        normalizeName(evidence.titleName) === normalizeName(target.name);
+
       if (
         evidence.open &&
-        (!evidence.titleName ||
-          normalizeName(evidence.titleName) === normalizeName(target.name))
+        (requireTargetTitle
+          ? titleMatches
+          : (!evidence.titleName || titleMatches))
       ) {
         return { ok: true, evidence };
       }
 
-      await sleep(60);
+      await sleep(requireTargetTitle ? 180 : 60);
     }
 
     return { ok: false, lastTitle };
   }
 
-  async function tryOpenTarget(target, index, reason, attempt) {
-    const live = await resolveFreshItem(target);
+  async function tryOpenTarget(target, index, reason, attempt, requireTargetTitle = false) {
+    const live = await resolveFreshItem(target, requireTargetTitle);
 
     if (!live?.root?.isConnected) {
       setStatus(`Transition failed: no fresh Drive row for ${target.name}`);
@@ -482,12 +502,21 @@
     }
 
     setStatus(
-      `Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}): ${target.name}`
+      `Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}${
+        requireTargetTitle ? ', guarded background' : ''
+      }): ${target.name}`
     );
-    addDiagnostic(`Open attempt ${attempt}: ${target.name}`);
+    addDiagnostic(
+      `Open attempt ${attempt}${requireTargetTitle ? ' [guarded background]' : ''}: ${target.name}`
+    );
     dispatchDoubleClick(live.root);
 
-    const result = await waitForPreview(target, 5200);
+    const result = await waitForPreview(
+      target,
+      requireTargetTitle ? 15000 : 5200,
+      requireTargetTitle
+    );
+
     if (result.ok) {
       addDiagnostic(
         `Preview confirmed: ${
@@ -590,32 +619,61 @@
 
     advancing = true;
     resetProgressTracking();
+    backgroundCloseUnconfirmed = false;
     const transitionStarted = performance.now();
 
     try {
       const target = playlist[index];
       const previousIndex = currentIndex;
+      const hiddenTransition = document.hidden;
 
-      if (getPreviewEvidence().open && !(await closePreview())) return false;
+      if (
+        getPreviewEvidence().open &&
+        !(await closePreview(hiddenTransition))
+      ) return false;
 
-      let opened = await tryOpenTarget(target, index, reason, 1);
+      let requireTargetTitle = backgroundCloseUnconfirmed;
+      let opened = await tryOpenTarget(
+        target,
+        index,
+        reason,
+        1,
+        requireTargetTitle
+      );
 
       if (!opened) {
         const evidence = getPreviewEvidence();
+        const titleMatches = Boolean(evidence.titleName) &&
+          normalizeName(evidence.titleName) === normalizeName(target.name);
+
         if (
           evidence.open &&
-          (!evidence.titleName ||
-            normalizeName(evidence.titleName) === normalizeName(target.name))
+          (requireTargetTitle
+            ? titleMatches
+            : (!evidence.titleName || titleMatches))
         ) {
           opened = true;
-          addDiagnostic('Late preview detected after timeout; accepting transition.');
+          addDiagnostic(
+            requireTargetTitle
+              ? 'Late target-title confirmation detected; accepting guarded background transition.'
+              : 'Late preview detected after timeout; accepting transition.'
+          );
         }
       }
 
       if (!opened) {
-        if (getPreviewEvidence().open) await closePreview();
-        await sleep(120);
-        opened = await tryOpenTarget(target, index, reason, 2);
+        if (getPreviewEvidence().open) {
+          await closePreview(document.hidden || requireTargetTitle);
+          requireTargetTitle = requireTargetTitle || backgroundCloseUnconfirmed;
+        }
+        await sleep(requireTargetTitle ? 500 : 120);
+        opened = await tryOpenTarget(
+          target,
+          index,
+          reason,
+          2,
+          requireTargetTitle
+        );
       }
 
       if (!opened) {
@@ -635,7 +693,9 @@
       renderPlaybackState(`Ready · transition ${elapsed} ms`);
       renderQueuePreview(playlist, currentIndex);
       addDiagnostic(
-        `Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.`
+        `Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.${
+          requireTargetTitle ? ' Guarded background path confirmed by target title.' : ''
+        }`
       );
       startMonitor();
       return true;
@@ -1160,7 +1220,7 @@
 
     const note = document.createElement('div');
     note.textContent =
-      'Probe 0.0.13 keeps the validated 0.0.12 Shuffle + Repeat + MP3/WebM playback core and makes this panel draggable by its title bar. Dragging is viewport-clamped and is intentionally not persisted after refresh. Still @grant none; no Google API.';
+      'Probe 0.0.14 keeps the validated 0.0.13 Shuffle + Repeat + draggable-panel + MP3/WebM core. Foreground transitions remain unchanged. When a hidden tab cannot confirm Drive preview closure in time, the script continues through a guarded background path and accepts the next track only after its exact preview title is confirmed. Still @grant none; no Google API.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - MP3 File-ID Direct Play Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.2
-// @description  Test whether a clicked Google Drive MP3 can play directly from its stable file ID without opening Drive Preview.
+// @version      0.0.3
+// @description  Test whether a clicked Google Drive MP3 can play directly from a captured stable file ID without opening Drive Preview.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,28 +13,26 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.2';
+  const VERSION = '0.0.3';
   const PANEL_ID = 'gdfp-file-id-direct-play-probe';
   const MP3_RE = /([^\/\n\r]{1,320}\.mp3)(?=\s|$)/i;
 
+  let clickedSnapshot = null;
   let selected = null;
   let testAudio = null;
   let currentMode = '';
   let logLines = [];
-  let lastClickedDriveRoot = null;
 
   function stamp() {
     return new Date().toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
   }
 
   function log(text) {
     const line = `${stamp()}  ${text}`;
     logLines.push(line);
-    logLines = logLines.slice(-60);
+    logLines = logLines.slice(-70);
     const box = document.querySelector(`#${PANEL_ID} [data-gdfp-idprobe="log"]`);
     if (box) box.textContent = logLines.join('\n');
     console.log('[GDFP File-ID Probe]', text);
@@ -59,7 +57,7 @@
       element.textContent
     ];
     for (const value of values) {
-      if (!value || value.length > 1600) continue;
+      if (!value || value.length > 1800) continue;
       const match = value.trim().match(MP3_RE);
       if (match) return match[1].trim();
     }
@@ -79,7 +77,8 @@
         node.hasAttribute('data-id') ||
         node.hasAttribute('data-target') ||
         node.hasAttribute('data-file-id') ||
-        node.hasAttribute('data-docid')
+        node.hasAttribute('data-docid') ||
+        node.hasAttribute('data-doc-id')
       ) fallback = node;
     }
     return fallback;
@@ -109,20 +108,32 @@
     const attributeNames = [
       'data-id', 'data-target', 'data-file-id', 'data-docid', 'data-doc-id'
     ];
-
-    const candidates = [root, ...root.querySelectorAll('[data-id], [data-target], [data-file-id], [data-docid], [data-doc-id], a[href]')];
+    const candidates = [
+      root,
+      ...root.querySelectorAll(
+        '[data-id], [data-target], [data-file-id], [data-docid], [data-doc-id], a[href]'
+      )
+    ];
 
     for (const element of candidates) {
       for (const attr of attributeNames) {
         const value = element.getAttribute?.(attr) || '';
         if (/^[A-Za-z0-9_-]{10,}$/.test(value)) return value;
       }
-
       const hrefId = idFromHref(element.getAttribute?.('href') || '');
       if (hrefId) return hrefId;
     }
-
     return '';
+  }
+
+  function renderSelected() {
+    const box = document.querySelector(`#${PANEL_ID} [data-gdfp-idprobe="selected"]`);
+    if (!box) return;
+    box.textContent = selected
+      ? `Selected: ${selected.name}\nDrive ID captured: yes`
+      : clickedSnapshot
+        ? `Clicked: ${clickedSnapshot.name}\nDrive ID captured: yes — press Capture`
+        : 'Selected: none';
   }
 
   function rememberDriveClick(event) {
@@ -135,56 +146,30 @@
     const name = extractName(root) || extractName(target);
     if (!name) return;
 
-    lastClickedDriveRoot = root;
     const id = getItemId(root);
-    log(`Remembered clicked MP3 row: ${name}${id ? ' | stable id present.' : ' | id not yet found.'}`);
-  }
-
-  function candidateSelectedElements() {
-    return [...document.querySelectorAll(
-      '[aria-selected="true"], [aria-checked="true"], [data-is-selected="true"], [data-selected="true"]'
-    )].filter(element => !element.closest(`#${PANEL_ID}`));
-  }
-
-  function captureFromRoot(root, sourceLabel) {
-    if (!(root instanceof Element) || !root.isConnected) return false;
-    const name = extractName(root);
-    const id = getItemId(root);
-    if (!name || !id) return false;
-
-    selected = { name, id };
-    renderSelected();
-    log(`Captured MP3 from ${sourceLabel}: ${name} | stable id present.`);
-    return true;
-  }
-
-  function captureSelectedRow() {
-    if (captureFromRoot(lastClickedDriveRoot, 'last clicked Drive row')) return;
-
-    const candidates = candidateSelectedElements();
-    for (const element of candidates) {
-      const root = findItemRoot(element);
-      if (captureFromRoot(root, 'Drive selection state')) return;
+    if (!id) {
+      log(`Clicked MP3 row detected but no stable ID was available yet: ${name}`);
+      return;
     }
 
-    selected = null;
+    // Important: snapshot the values immediately. Drive may replace the selected
+    // row DOM node after the click because its file list is virtualized.
+    clickedSnapshot = { name, id };
     renderSelected();
-
-    if (lastClickedDriveRoot) {
-      const rememberedName = extractName(lastClickedDriveRoot) || '(name unavailable)';
-      const rememberedId = getItemId(lastClickedDriveRoot);
-      log(`Clicked row was remembered (${rememberedName}), but no stable Drive ID was found${rememberedId ? '' : '.'}`);
-    } else {
-      log('No MP3 row click was remembered. Single-click directly on an MP3 filename row, then press Capture selected MP3 row.');
-    }
+    log(`Remembered clicked MP3 row snapshot: ${name} | stable id captured.`);
   }
 
-  function renderSelected() {
-    const box = document.querySelector(`#${PANEL_ID} [data-gdfp-idprobe="selected"]`);
-    if (!box) return;
-    box.textContent = selected
-      ? `Selected: ${selected.name}\nDrive ID: ${selected.id}`
-      : 'Selected: none';
+  function captureClickedRow() {
+    if (!clickedSnapshot?.name || !clickedSnapshot?.id) {
+      selected = null;
+      renderSelected();
+      log('No valid clicked MP3 snapshot is available. Single-click an MP3 filename row, then try again.');
+      return;
+    }
+
+    selected = { ...clickedSnapshot };
+    renderSelected();
+    log(`Captured MP3 snapshot: ${selected.name} | stable id retained even if Drive replaced the row DOM.`);
   }
 
   function destroyAudio() {
@@ -222,25 +207,28 @@
     audio.src = url;
     audio.load();
     log(`${mode} load requested: ${sanitizeUrl(url)}`);
-    return audio;
   }
 
   function requireSelected() {
     if (selected?.id) return true;
-    log('Capture a clicked MP3 row first.');
+    log('Capture the clicked MP3 snapshot first.');
     return false;
   }
 
   function tryDriveUc() {
     if (!requireSelected()) return;
-    const url = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(selected.id)}`;
-    makeAudio(url, 'drive.google.com/uc');
+    makeAudio(
+      `https://drive.google.com/uc?export=download&id=${encodeURIComponent(selected.id)}`,
+      'drive.google.com/uc'
+    );
   }
 
   function tryUsercontent() {
     if (!requireSelected()) return;
-    const url = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(selected.id)}&export=download`;
-    makeAudio(url, 'drive.usercontent');
+    makeAudio(
+      `https://drive.usercontent.google.com/download?id=${encodeURIComponent(selected.id)}&export=download`,
+      'drive.usercontent'
+    );
   }
 
   async function playLoaded() {
@@ -248,7 +236,6 @@
       log('No candidate is loaded yet.');
       return;
     }
-
     try {
       await testAudio.play();
       log(`${currentMode} play() resolved.`);
@@ -268,13 +255,10 @@
     button.type = 'button';
     button.textContent = label;
     Object.assign(button.style, {
-      padding: '6px 9px',
-      borderRadius: '6px',
+      padding: '6px 9px', borderRadius: '6px',
       border: '1px solid rgba(255,255,255,.24)',
-      background: 'rgba(255,255,255,.10)',
-      color: 'inherit',
-      cursor: 'pointer',
-      font: 'inherit'
+      background: 'rgba(255,255,255,.10)', color: 'inherit',
+      cursor: 'pointer', font: 'inherit'
     });
     button.addEventListener('click', handler);
     return button;
@@ -286,19 +270,10 @@
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
     Object.assign(panel.style, {
-      position: 'fixed',
-      left: '16px',
-      bottom: '16px',
-      zIndex: '2147483647',
-      width: '560px',
-      maxHeight: '58vh',
-      overflow: 'auto',
-      boxSizing: 'border-box',
-      padding: '10px',
-      borderRadius: '10px',
-      background: 'rgba(25,27,30,.96)',
-      color: '#f1f3f4',
-      border: '1px solid rgba(255,255,255,.18)',
+      position: 'fixed', left: '16px', bottom: '16px', zIndex: '2147483647',
+      width: '570px', maxHeight: '58vh', overflow: 'auto', boxSizing: 'border-box',
+      padding: '10px', borderRadius: '10px', background: 'rgba(25,27,30,.96)',
+      color: '#f1f3f4', border: '1px solid rgba(255,255,255,.18)',
       boxShadow: '0 6px 22px rgba(0,0,0,.3)',
       font: '12px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
@@ -309,7 +284,7 @@
     title.style.marginBottom = '5px';
 
     const note = document.createElement('div');
-    note.textContent = 'No Preview required. Single-click directly on an MP3 row first; this version remembers the clicked Drive row even when Drive does not expose aria-selected=true. Then capture it and try the direct URL forms.';
+    note.textContent = 'No Preview required. This version snapshots the MP3 filename + Drive ID at click time, so Drive DOM replacement after selection cannot erase the captured target.';
     note.style.opacity = '0.78';
     note.style.marginBottom = '8px';
 
@@ -317,23 +292,16 @@
     selectedBox.dataset.gdfpIdprobe = 'selected';
     selectedBox.textContent = 'Selected: none';
     Object.assign(selectedBox.style, {
-      marginBottom: '8px',
-      padding: '7px',
-      borderRadius: '6px',
-      background: 'rgba(129,201,149,.10)',
-      whiteSpace: 'pre-wrap',
-      overflowWrap: 'anywhere'
+      marginBottom: '8px', padding: '7px', borderRadius: '6px',
+      background: 'rgba(129,201,149,.10)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere'
     });
 
     const controls = document.createElement('div');
     Object.assign(controls.style, {
-      display: 'flex',
-      gap: '6px',
-      flexWrap: 'wrap',
-      marginBottom: '8px'
+      display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px'
     });
     controls.append(
-      makeButton('Capture clicked MP3 row', captureSelectedRow),
+      makeButton('Capture clicked MP3', captureClickedRow),
       makeButton('Try drive.google.com/uc', tryDriveUc),
       makeButton('Try drive.usercontent', tryUsercontent),
       makeButton('Play loaded candidate', playLoaded),
@@ -343,18 +311,14 @@
     const logBox = document.createElement('div');
     logBox.dataset.gdfpIdprobe = 'log';
     Object.assign(logBox.style, {
-      whiteSpace: 'pre-wrap',
-      overflowWrap: 'anywhere',
-      padding: '8px',
-      borderRadius: '6px',
-      background: 'rgba(138,180,248,.10)',
-      border: '1px solid rgba(138,180,248,.22)',
-      minHeight: '90px'
+      whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', padding: '8px',
+      borderRadius: '6px', background: 'rgba(138,180,248,.10)',
+      border: '1px solid rgba(138,180,248,.22)', minHeight: '90px'
     });
 
     panel.append(title, note, selectedBox, controls, logBox);
     document.body.appendChild(panel);
-    log(`Probe ${VERSION} mounted. Click tracking active.`);
+    log(`Probe ${VERSION} mounted. Click-time snapshot tracking active.`);
   }
 
   function init() {

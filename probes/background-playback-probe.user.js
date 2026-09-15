@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Background Playback Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
+// @version      0.0.2
 // @description  Passive diagnostics for background-tab playback stalls. Does not control Google Drive playback.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.1';
+  const VERSION = '0.0.2';
   const PANEL_ID = 'gdfp-background-probe';
   const STORAGE_KEY = 'gdfp-background-probe-log-v1';
   const MAX_LOG_LINES = 120;
@@ -21,8 +21,8 @@
 
   let lines = loadLines();
   let lastTickAt = performance.now();
-  let lastMainPlaybackText = '';
   let lastMainStatusText = '';
+  let lastTrackMarker = '';
   let lastProgress = null;
   let lastProgressSeenAt = 0;
   let lastMilestone = -1;
@@ -68,6 +68,7 @@
     saveLines();
     lastMilestone = -1;
     missingNearEndLogged = false;
+    lastProgress = null;
     log(`Log cleared. Probe ${VERSION} active; visibility=${document.visibilityState}.`);
   }
 
@@ -137,6 +138,13 @@
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
+  function extractTrackMarker(playback) {
+    const position = playback.match(/Track:\s*([^|]+)/i)?.[1]?.trim() || '';
+    const lines = String(playback || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+    const name = lines.length > 1 ? lines[lines.length - 1] : '';
+    return `${position}::${name}`;
+  }
+
   function tick() {
     const now = performance.now();
     const gap = now - lastTickAt;
@@ -150,10 +158,18 @@
     const playback = compact(main.playback);
     const status = compact(main.status);
 
-    if (playback && playback !== lastMainPlaybackText) {
-      const meaningful = /Track:|Playlist finished|Stopped|Transition failed|Repeat|Ready|%/.test(playback);
-      if (meaningful) log(`MAIN playback: ${playback}`);
-      lastMainPlaybackText = playback;
+    if (playback) {
+      const marker = extractTrackMarker(main.playback);
+      if (marker && marker !== lastTrackMarker) {
+        lastTrackMarker = marker;
+        log(`TRACK -> ${marker.replace('::', ' | ')}`);
+        lastMilestone = -1;
+        missingNearEndLogged = false;
+        lastProgress = null;
+      }
+      if (/Playlist finished|Stopped|Transition failed/i.test(playback)) {
+        log(`MAIN playback terminal state: ${playback}`);
+      }
     }
 
     if (status && status !== lastMainStatusText) {
@@ -164,6 +180,7 @@
 
     const progress = sampleProgress();
     if (progress) {
+      const previous = lastProgress;
       lastProgress = progress;
       lastProgressSeenAt = Date.now();
       missingNearEndLogged = false;
@@ -174,7 +191,7 @@
         log(`Progress ${Math.round(progress.ratio * 1000) / 10}% via ${progress.source}; visibility=${document.visibilityState}.`);
       }
 
-      if (progress.ratio >= 0.99 && lastProgress?.ratio < 0.99) {
+      if (progress.ratio >= 0.99 && (!previous || previous.ratio < 0.99)) {
         log(`Progress crossed 99% via ${progress.source}.`);
       }
     } else if (

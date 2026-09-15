@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - MP3 File-ID Direct Play Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
-// @description  Test whether a selected Google Drive MP3 can play directly from its stable file ID without opening Drive Preview.
+// @version      0.0.2
+// @description  Test whether a clicked Google Drive MP3 can play directly from its stable file ID without opening Drive Preview.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.1';
+  const VERSION = '0.0.2';
   const PANEL_ID = 'gdfp-file-id-direct-play-probe';
   const MP3_RE = /([^\/\n\r]{1,320}\.mp3)(?=\s|$)/i;
 
@@ -21,6 +21,7 @@
   let testAudio = null;
   let currentMode = '';
   let logLines = [];
+  let lastClickedDriveRoot = null;
 
   function stamp() {
     return new Date().toLocaleTimeString([], {
@@ -58,7 +59,7 @@
       element.textContent
     ];
     for (const value of values) {
-      if (!value || value.length > 1000) continue;
+      if (!value || value.length > 1600) continue;
       const match = value.trim().match(MP3_RE);
       if (match) return match[1].trim();
     }
@@ -68,48 +69,114 @@
   function findItemRoot(element) {
     let node = element;
     let fallback = element;
-    for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+    for (let depth = 0; node && depth < 14; depth += 1, node = node.parentElement) {
       if (!(node instanceof Element)) break;
+      if (node.closest?.(`#${PANEL_ID}`)) break;
       const role = node.getAttribute('role');
       if (role === 'row' || role === 'listitem') return node;
       if (role === 'gridcell' || role === 'rowheader') fallback = node;
-      if (node.hasAttribute('data-id') || node.hasAttribute('data-target')) fallback = node;
+      if (
+        node.hasAttribute('data-id') ||
+        node.hasAttribute('data-target') ||
+        node.hasAttribute('data-file-id') ||
+        node.hasAttribute('data-docid')
+      ) fallback = node;
     }
     return fallback;
   }
 
+  function idFromHref(value) {
+    if (!value) return '';
+    try {
+      const url = new URL(value, location.href);
+      const queryId = url.searchParams.get('id');
+      if (queryId && /^[A-Za-z0-9_-]{10,}$/.test(queryId)) return queryId;
+      const fileMatch = url.pathname.match(/\/file\/d\/([A-Za-z0-9_-]{10,})/);
+      if (fileMatch) return fileMatch[1];
+    } catch {
+      const text = String(value);
+      const fileMatch = text.match(/\/file\/d\/([A-Za-z0-9_-]{10,})/);
+      if (fileMatch) return fileMatch[1];
+      const queryMatch = text.match(/[?&]id=([A-Za-z0-9_-]{10,})/);
+      if (queryMatch) return queryMatch[1];
+    }
+    return '';
+  }
+
   function getItemId(root) {
     if (!(root instanceof Element)) return '';
-    const direct = root.getAttribute('data-id') || root.getAttribute('data-target');
-    if (direct) return direct;
-    const child = root.querySelector('[data-id], [data-target]');
-    return child?.getAttribute('data-id') || child?.getAttribute('data-target') || '';
+
+    const attributeNames = [
+      'data-id', 'data-target', 'data-file-id', 'data-docid', 'data-doc-id'
+    ];
+
+    const candidates = [root, ...root.querySelectorAll('[data-id], [data-target], [data-file-id], [data-docid], [data-doc-id], a[href]')];
+
+    for (const element of candidates) {
+      for (const attr of attributeNames) {
+        const value = element.getAttribute?.(attr) || '';
+        if (/^[A-Za-z0-9_-]{10,}$/.test(value)) return value;
+      }
+
+      const hrefId = idFromHref(element.getAttribute?.('href') || '');
+      if (hrefId) return hrefId;
+    }
+
+    return '';
+  }
+
+  function rememberDriveClick(event) {
+    const target = event.target;
+    if (!(target instanceof Element) || target.closest(`#${PANEL_ID}`)) return;
+
+    const root = findItemRoot(target);
+    if (!root || root.closest?.(`#${PANEL_ID}`)) return;
+
+    const name = extractName(root) || extractName(target);
+    if (!name) return;
+
+    lastClickedDriveRoot = root;
+    const id = getItemId(root);
+    log(`Remembered clicked MP3 row: ${name}${id ? ' | stable id present.' : ' | id not yet found.'}`);
   }
 
   function candidateSelectedElements() {
     return [...document.querySelectorAll(
-      '[aria-selected="true"], [data-is-selected="true"], [data-selected="true"]'
+      '[aria-selected="true"], [aria-checked="true"], [data-is-selected="true"], [data-selected="true"]'
     )].filter(element => !element.closest(`#${PANEL_ID}`));
   }
 
-  function captureSelectedRow() {
-    const candidates = candidateSelectedElements();
+  function captureFromRoot(root, sourceLabel) {
+    if (!(root instanceof Element) || !root.isConnected) return false;
+    const name = extractName(root);
+    const id = getItemId(root);
+    if (!name || !id) return false;
 
+    selected = { name, id };
+    renderSelected();
+    log(`Captured MP3 from ${sourceLabel}: ${name} | stable id present.`);
+    return true;
+  }
+
+  function captureSelectedRow() {
+    if (captureFromRoot(lastClickedDriveRoot, 'last clicked Drive row')) return;
+
+    const candidates = candidateSelectedElements();
     for (const element of candidates) {
       const root = findItemRoot(element);
-      const name = extractName(root) || extractName(element);
-      const id = getItemId(root);
-      if (name && id) {
-        selected = { name, id };
-        renderSelected();
-        log(`Captured selected MP3 row: ${name} | stable id present.`);
-        return;
-      }
+      if (captureFromRoot(root, 'Drive selection state')) return;
     }
 
     selected = null;
     renderSelected();
-    log('No selected MP3 row with a stable Drive ID was found. Single-click one MP3 in the file list, then try again.');
+
+    if (lastClickedDriveRoot) {
+      const rememberedName = extractName(lastClickedDriveRoot) || '(name unavailable)';
+      const rememberedId = getItemId(lastClickedDriveRoot);
+      log(`Clicked row was remembered (${rememberedName}), but no stable Drive ID was found${rememberedId ? '' : '.'}`);
+    } else {
+      log('No MP3 row click was remembered. Single-click directly on an MP3 filename row, then press Capture selected MP3 row.');
+    }
   }
 
   function renderSelected() {
@@ -160,7 +227,7 @@
 
   function requireSelected() {
     if (selected?.id) return true;
-    log('Capture a selected MP3 row first.');
+    log('Capture a clicked MP3 row first.');
     return false;
   }
 
@@ -223,7 +290,7 @@
       left: '16px',
       bottom: '16px',
       zIndex: '2147483647',
-      width: '520px',
+      width: '560px',
       maxHeight: '58vh',
       overflow: 'auto',
       boxSizing: 'border-box',
@@ -242,7 +309,7 @@
     title.style.marginBottom = '5px';
 
     const note = document.createElement('div');
-    note.textContent = 'No Preview required for the test. Single-click one MP3 row in Drive, capture it here, then try the two direct URL forms. The probe never logs query values.';
+    note.textContent = 'No Preview required. Single-click directly on an MP3 row first; this version remembers the clicked Drive row even when Drive does not expose aria-selected=true. Then capture it and try the direct URL forms.';
     note.style.opacity = '0.78';
     note.style.marginBottom = '8px';
 
@@ -266,7 +333,7 @@
       marginBottom: '8px'
     });
     controls.append(
-      makeButton('Capture selected MP3 row', captureSelectedRow),
+      makeButton('Capture clicked MP3 row', captureSelectedRow),
       makeButton('Try drive.google.com/uc', tryDriveUc),
       makeButton('Try drive.usercontent', tryUsercontent),
       makeButton('Play loaded candidate', playLoaded),
@@ -287,11 +354,12 @@
 
     panel.append(title, note, selectedBox, controls, logBox);
     document.body.appendChild(panel);
-    log(`Probe ${VERSION} mounted.`);
+    log(`Probe ${VERSION} mounted. Click tracking active.`);
   }
 
   function init() {
     if (!document.body) return setTimeout(init, 100);
+    document.addEventListener('click', rememberDriveClick, true);
     mountPanel();
   }
 

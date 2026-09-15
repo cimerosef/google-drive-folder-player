@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.14
-// @description  Continuous Google Drive media playback with guarded background-tab transitions.
+// @version      0.0.15
+// @description  Continuous Google Drive media playback with guarded background transitions and next-track prewarming.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,9 +13,10 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.14';
+  const VERSION = '0.0.15';
   const PANEL_ID = 'gdfp-probe-panel';
   const REPEAT_MODES = ['off', 'all', 'one'];
+  const PREWARM_RATIO = 0.85;
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
     'webm', 'aiff', 'aif', 'm4b', 'mp4'
@@ -38,6 +39,10 @@
   let lastRatio = null;
   let diagnosticHistory = [];
   let backgroundCloseUnconfirmed = false;
+
+  let prewarmInFlight = false;
+  let prewarmAttemptedTrack = -1;
+  let prewarmedNext = null;
 
   let hiddenRangePrevious = new WeakMap();
   let hiddenRangeActive = null;
@@ -467,6 +472,115 @@
     return null;
   }
 
+  function clearPrewarmState() {
+    prewarmInFlight = false;
+    prewarmAttemptedTrack = -1;
+    prewarmedNext = null;
+  }
+
+  function naturalNextIndex() {
+    if (currentIndex < 0 || !playlist.length) return -1;
+    if (repeatMode === 'one') return currentIndex;
+    const nextIndex = currentIndex + 1;
+    if (nextIndex < playlist.length) return nextIndex;
+    return repeatMode === 'all' ? 0 : -1;
+  }
+
+  async function prewarmUpcomingTrack() {
+    if (
+      !autoMode ||
+      advancing ||
+      currentIndex < 0 ||
+      prewarmInFlight ||
+      prewarmAttemptedTrack === currentIndex
+    ) return;
+
+    const fromIndex = currentIndex;
+    const nextIndex = naturalNextIndex();
+    if (nextIndex < 0 || !playlist[nextIndex]) return;
+
+    const target = playlist[nextIndex];
+    prewarmAttemptedTrack = fromIndex;
+    prewarmInFlight = true;
+
+    try {
+      let item = collectFolderRows().find(row => matchesTarget(row, target));
+
+      if (!item) {
+        const cached = detectedItems.find(row => matchesTarget(row, target));
+        if (cached?.root?.isConnected && isVisible(cached.root)) item = cached;
+      }
+
+      if (!item?.root?.isConnected || !isVisible(item.root)) {
+        addDiagnostic(
+          `Prewarm fallback: next row is not currently reusable; normal transition kept for ${target.name}.`
+        );
+        return;
+      }
+
+      let scrolled = false;
+      if (rowNeedsScroll(item.root)) {
+        item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
+        scrolled = true;
+        await sleep(document.hidden ? 250 : 120);
+
+        const refreshed = collectFolderRows().find(row => matchesTarget(row, target));
+        if (refreshed?.root?.isConnected && isVisible(refreshed.root)) item = refreshed;
+      }
+
+      if (
+        !autoMode ||
+        advancing ||
+        currentIndex !== fromIndex ||
+        !item?.root?.isConnected ||
+        !isVisible(item.root)
+      ) return;
+
+      prewarmedNext = {
+        fromIndex,
+        index: nextIndex,
+        name: target.name,
+        id: target.id || '',
+        root: item.root,
+        preparedAt: performance.now(),
+        scrolled
+      };
+
+      addDiagnostic(
+        `Prewarmed track ${nextIndex + 1}/${playlist.length}${
+          scrolled ? ' after positioning its Drive row' : ''
+        }: ${target.name}`
+      );
+    } finally {
+      prewarmInFlight = false;
+    }
+  }
+
+  function takePrewarmedItem(target, index) {
+    const prepared = prewarmedNext;
+    clearPrewarmState();
+
+    if (
+      !prepared ||
+      prepared.index !== index ||
+      !matchesTarget(prepared, target) ||
+      !prepared.root?.isConnected ||
+      !isVisible(prepared.root)
+    ) return null;
+
+    addDiagnostic(
+      `Using prewarmed Drive row for track ${index + 1}; prepared ${Math.round(
+        performance.now() - prepared.preparedAt
+      )} ms earlier.`
+    );
+
+    return {
+      name: prepared.name,
+      id: prepared.id,
+      root: prepared.root
+    };
+  }
+
   async function waitForPreview(target, timeoutMs = 5200, requireTargetTitle = false) {
     const started = Date.now();
     let lastTitle = '';
@@ -493,8 +607,23 @@
     return { ok: false, lastTitle };
   }
 
-  async function tryOpenTarget(target, index, reason, attempt, requireTargetTitle = false) {
-    const live = await resolveFreshItem(target, requireTargetTitle);
+  async function tryOpenTarget(
+    target,
+    index,
+    reason,
+    attempt,
+    requireTargetTitle = false,
+    preferredLive = null
+  ) {
+    let live = preferredLive;
+
+    if (
+      !live?.root?.isConnected ||
+      !isVisible(live.root) ||
+      !matchesTarget(live, target)
+    ) {
+      live = await resolveFreshItem(target, requireTargetTitle);
+    }
 
     if (!live?.root?.isConnected) {
       setStatus(`Transition failed: no fresh Drive row for ${target.name}`);
@@ -507,7 +636,9 @@
       }): ${target.name}`
     );
     addDiagnostic(
-      `Open attempt ${attempt}${requireTargetTitle ? ' [guarded background]' : ''}: ${target.name}`
+      `Open attempt ${attempt}${requireTargetTitle ? ' [guarded background]' : ''}${
+        preferredLive ? ' [prewarmed row]' : ''
+      }: ${target.name}`
     );
     dispatchDoubleClick(live.root);
 
@@ -564,6 +695,7 @@
 
   function toggleShuffle() {
     shuffleMode = !shuffleMode;
+    if (!autoMode) clearPrewarmState();
     updateShuffleButton();
 
     renderPlaybackState(
@@ -596,6 +728,7 @@
   function toggleRepeat() {
     const index = REPEAT_MODES.indexOf(repeatMode);
     repeatMode = REPEAT_MODES[(index + 1) % REPEAT_MODES.length];
+    clearPrewarmState();
     updateRepeatButton();
     renderPlaybackState('Repeat setting changed');
     renderQueuePreview(playlist, currentIndex);
@@ -626,6 +759,7 @@
       const target = playlist[index];
       const previousIndex = currentIndex;
       const hiddenTransition = document.hidden;
+      const preparedLive = takePrewarmedItem(target, index);
 
       if (
         getPreviewEvidence().open &&
@@ -638,7 +772,8 @@
         index,
         reason,
         1,
-        requireTargetTitle
+        requireTargetTitle,
+        preparedLive
       );
 
       if (!opened) {
@@ -695,7 +830,7 @@
       addDiagnostic(
         `Transition accepted -> track ${index + 1}/${playlist.length} in ${elapsed} ms.${
           requireTargetTitle ? ' Guarded background path confirmed by target title.' : ''
-        }`
+        }${preparedLive ? ' Prewarmed row used.' : ''}`
       );
       startMonitor();
       return true;
@@ -717,6 +852,7 @@
     playlist = buildPlaylist();
     currentIndex = -1;
     diagnosticHistory = [];
+    clearPrewarmState();
     renderQueuePreview(playlist, currentIndex);
 
     addDiagnostic(
@@ -737,6 +873,7 @@
   function stopContinuousTest() {
     autoMode = false;
     resetProgressTracking();
+    clearPrewarmState();
 
     if (monitorTimer) {
       clearInterval(monitorTimer);
@@ -806,6 +943,7 @@
       }
 
       autoMode = false;
+      clearPrewarmState();
       setStatus(
         `${playlistShuffled ? 'Shuffled' : 'Cached'} playlist finished (${playlist.length} track(s)).`
       );
@@ -836,11 +974,26 @@
     const ratio = progress.ratio;
     if (!endArmed && ratio < 0.95) endArmed = true;
 
+    if (
+      ratio >= PREWARM_RATIO &&
+      prewarmAttemptedTrack !== currentIndex &&
+      !prewarmInFlight
+    ) {
+      void prewarmUpcomingTrack();
+    }
+
     const percent = Math.round(ratio * 1000) / 10;
+    const prewarmDetail =
+      prewarmedNext?.fromIndex === currentIndex
+        ? ' · next ready'
+        : prewarmAttemptedTrack === currentIndex
+          ? ' · prewarm fallback'
+          : '';
+
     renderPlaybackState(
       `${percent}% · ${progress.source}${
         endArmed ? ' · armed' : ' · waiting reset'
-      }`
+      }${prewarmDetail}`
     );
 
     if (
@@ -1220,7 +1373,7 @@
 
     const note = document.createElement('div');
     note.textContent =
-      'Probe 0.0.14 keeps the validated 0.0.13 Shuffle + Repeat + draggable-panel + MP3/WebM core. Foreground transitions remain unchanged. When a hidden tab cannot confirm Drive preview closure in time, the script continues through a guarded background path and accepts the next track only after its exact preview title is confirmed. Still @grant none; no Google API.';
+      'Probe 0.0.15 keeps the 0.0.14 guarded background-transition fix and prewarms the next queue item at about 85% progress by resolving and positioning its Drive row before the current track ends. This is a conservative row/DOM prewarm, not direct media-stream preloading. Shuffle, Repeat, draggable-panel, MP3/WebM handling, @grant none, and no-Google-API constraints remain unchanged.';
     Object.assign(note.style, {
       marginTop: '9px',
       paddingTop: '8px',

@@ -2,7 +2,7 @@
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
 // @version      0.0.26
-// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Pause, Shuffle and Repeat.
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -391,12 +391,12 @@
       }
       if (slot === directCurrent) {
         autoMode = true;
-        updatePauseButtons();
+        updateTransportButtons();
         renderDiscoverySummary();
       }
     });
     media.addEventListener('pause', () => {
-      if (slot === directCurrent && !media.ended) updatePauseButtons();
+      if (slot === directCurrent && !media.ended) updateTransportButtons();
     });
     media.addEventListener('ended', () => {
       if (directCurrent !== slot || currentIndex !== index) return;
@@ -492,6 +492,7 @@
       renderPlayback();
       renderQueue();
       renderDiscoverySummary();
+      updateTransportButtons();
       return true;
     } catch (error) {
       transitionRequestedAt = 0;
@@ -500,7 +501,7 @@
       if (!oldCurrent) autoMode = false;
       setStatus(`Playback failed: ${error?.name || 'Error'}`);
       log(`play() failed for ${target.name}: ${error?.name || 'Error'}.`);
-      updatePauseButtons();
+      updateTransportButtons();
       return false;
     } finally {
       advancing = false;
@@ -536,8 +537,26 @@
     await playIndex(0, 'start');
   }
 
+  async function previousNow() {
+    if (!playlist.length || currentIndex < 0) {
+      setStatus('Start playback first.');
+      return;
+    }
+    autoMode = true;
+    let previous = currentIndex - 1;
+    if (previous < 0) {
+      if (repeatMode === 'all') previous = playlist.length - 1;
+      else {
+        setStatus('Start of queue.');
+        updateTransportButtons();
+        return;
+      }
+    }
+    await playIndex(previous, 'Previous');
+  }
+
   async function nextNow() {
-    if (!playlist.length) {
+    if (!playlist.length || currentIndex < 0) {
       setStatus('Start playback first.');
       return;
     }
@@ -547,6 +566,7 @@
       if (repeatMode === 'all') next = 0;
       else {
         setStatus('End of queue.');
+        updateTransportButtons();
         return;
       }
     }
@@ -558,7 +578,7 @@
     const item = playlist[currentIndex];
     if (!media || !item || media.ended) {
       setStatus('Nothing is currently available to pause or resume.');
-      updatePauseButtons();
+      updateTransportButtons();
       return;
     }
 
@@ -568,7 +588,7 @@
       autoMode = false;
       setStatus(`Paused ${currentIndex + 1}/${playlist.length}: ${item.name}`);
       log(`Paused track ${currentIndex + 1}/${playlist.length}.`);
-      updatePauseButtons();
+      updateTransportButtons();
       renderPlayback();
       renderDiscoverySummary();
       return;
@@ -585,7 +605,7 @@
       setStatus(`Resume failed: ${error?.name || 'Error'}`);
       log(`Resume failed for ${item.name}: ${error?.name || 'Error'}.`);
     }
-    updatePauseButtons();
+    updateTransportButtons();
     renderPlayback();
     renderDiscoverySummary();
   }
@@ -619,7 +639,7 @@
         setStatus(`Queue finished (${playlist.length} tracks).`);
         renderPlayback();
         renderDiscoverySummary();
-        updatePauseButtons();
+        updateTransportButtons();
         return;
       }
     }
@@ -633,7 +653,7 @@
     setStatus('Playback stopped.');
     renderPlayback();
     renderDiscoverySummary();
-    updatePauseButtons();
+    updateTransportButtons();
   }
 
   function toggleShuffle() {
@@ -649,27 +669,38 @@
     setStatus(`Repeat ${repeatMode.toUpperCase()}.`);
   }
 
-  function updatePauseButtons() {
-    const media = directCurrent?.media;
-    const canToggle = Boolean(media && currentIndex >= 0 && playlist[currentIndex] && !media.ended);
-    const paused = canToggle && media.paused;
-    const fullButton = document.querySelector(`#${PANEL_ID} [data-gdfp="pause"]`);
-    const miniButton = document.querySelector(`#${PANEL_ID} [data-gdfp="mini-pause"]`);
+  function setTransportButtonState(node, enabled) {
+    if (!node) return;
+    node.disabled = !enabled;
+    node.style.opacity = enabled ? '1' : '0.45';
+    node.style.cursor = enabled ? 'pointer' : 'default';
+  }
 
-    if (fullButton) {
-      fullButton.disabled = !canToggle;
-      fullButton.textContent = paused ? 'Resume' : 'Pause';
-      fullButton.style.opacity = canToggle ? '1' : '0.55';
-      fullButton.style.cursor = canToggle ? 'pointer' : 'default';
+  function updateTransportButtons() {
+    const media = directCurrent?.media;
+    const hasCurrent = Boolean(media && currentIndex >= 0 && playlist[currentIndex] && !media.ended);
+    const paused = hasCurrent && media.paused;
+    const hasQueuePosition = playlist.length > 0 && currentIndex >= 0;
+    const canPrevious = hasQueuePosition && (currentIndex > 0 || repeatMode === 'all');
+    const canNext = hasQueuePosition && (currentIndex < playlist.length - 1 || repeatMode === 'all');
+
+    for (const role of ['previous', 'mini-previous']) {
+      const node = document.querySelector(`#${PANEL_ID} [data-gdfp="${role}"]`);
+      setTransportButtonState(node, canPrevious);
     }
 
-    if (miniButton) {
-      miniButton.disabled = !canToggle;
-      miniButton.textContent = paused ? '▶' : 'Ⅱ';
-      miniButton.title = paused ? 'Resume playback' : 'Pause playback';
-      miniButton.setAttribute('aria-label', paused ? 'Resume playback' : 'Pause playback');
-      miniButton.style.opacity = canToggle ? '1' : '0.45';
-      miniButton.style.cursor = canToggle ? 'pointer' : 'default';
+    for (const role of ['next', 'mini-next']) {
+      const node = document.querySelector(`#${PANEL_ID} [data-gdfp="${role}"]`);
+      setTransportButtonState(node, canNext);
+    }
+
+    for (const role of ['pause', 'mini-pause']) {
+      const node = document.querySelector(`#${PANEL_ID} [data-gdfp="${role}"]`);
+      if (!node) continue;
+      setTransportButtonState(node, hasCurrent);
+      node.textContent = paused ? '▶' : '⏸';
+      node.title = paused ? 'Resume playback' : 'Pause playback';
+      node.setAttribute('aria-label', paused ? 'Resume playback' : 'Pause playback');
     }
   }
 
@@ -684,12 +715,12 @@
       repeat.textContent = `Repeat: ${repeatMode.toUpperCase()}`;
       repeat.style.background = repeatMode === 'off' ? 'rgba(255,255,255,.10)' : repeatMode === 'all' ? 'rgba(138,180,248,.22)' : 'rgba(196,181,253,.22)';
     }
-    updatePauseButtons();
+    updateTransportButtons();
   }
 
   function renderPlayback() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="playback"]`);
-    updatePauseButtons();
+    updateTransportButtons();
     if (!node) return;
     if (!directCurrent || currentIndex < 0 || !playlist[currentIndex]) {
       node.textContent = playlist.length ? `Stopped · ${playlist.length}-track queue` : 'Not playing';
@@ -700,7 +731,7 @@
     const ratio = Number.isFinite(media.duration) && media.duration > 0 ? media.currentTime / media.duration : 0;
     const percent = Math.round(Math.max(0, Math.min(1, ratio)) * 1000) / 10;
     const preload = directNext ? (directNext.ready ? 'next ready' : 'next loading') : 'no preload';
-    const state = media.paused ? 'Ⅱ' : '▶';
+    const state = media.paused ? '⏸' : '▶';
     node.textContent = `${state} ${currentIndex + 1}/${playlist.length} · ${labelOf(current)} · ${percent}% · ${preload}\n${current.name}`;
   }
 
@@ -731,6 +762,17 @@
       background: 'rgba(255,255,255,.10)', color: 'inherit', cursor: 'pointer', font: 'inherit'
     });
     node.addEventListener('click', handler);
+    return node;
+  }
+
+  function transportButton(symbol, title, handler, role) {
+    const node = button(symbol, handler, role);
+    node.title = title;
+    node.setAttribute('aria-label', title);
+    Object.assign(node.style, {
+      width: '42px', height: '34px', padding: '0', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: '17px', fontWeight: '700', lineHeight: '1'
+    });
     return node;
   }
 
@@ -815,7 +857,7 @@
 
     const header = document.createElement('div');
     Object.assign(header.style, {
-      display: 'flex', alignItems: 'center', gap: '8px', minHeight: '24px'
+      display: 'flex', alignItems: 'center', gap: '7px', minHeight: '24px'
     });
 
     const title = document.createElement('div');
@@ -826,21 +868,17 @@
       whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
     });
 
-    const miniPauseButton = document.createElement('button');
-    miniPauseButton.type = 'button';
-    miniPauseButton.dataset.gdfp = 'mini-pause';
-    miniPauseButton.textContent = 'Ⅱ';
-    miniPauseButton.title = 'Pause playback';
-    miniPauseButton.setAttribute('aria-label', 'Pause playback');
-    Object.assign(miniPauseButton.style, {
-      display: 'none', flex: '0 0 auto', width: '28px', height: '26px', padding: '0', borderRadius: '6px',
-      border: '1px solid rgba(255,255,255,.22)', background: 'rgba(255,255,255,.08)', color: 'inherit',
-      cursor: 'pointer', font: '700 13px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
-    });
-    miniPauseButton.addEventListener('click', event => {
-      event.stopPropagation();
-      void togglePause();
-    });
+    const miniTransport = document.createElement('div');
+    Object.assign(miniTransport.style, { display: 'none', alignItems: 'center', gap: '5px', flex: '0 0 auto' });
+
+    const miniPreviousButton = transportButton('⏮', 'Previous track', () => void previousNow(), 'mini-previous');
+    const miniPauseButton = transportButton('⏸', 'Pause playback', () => void togglePause(), 'mini-pause');
+    const miniNextButton = transportButton('⏭', 'Next track', () => void nextNow(), 'mini-next');
+    for (const node of [miniPreviousButton, miniPauseButton, miniNextButton]) {
+      Object.assign(node.style, { width: '28px', height: '26px', fontSize: '13px', borderRadius: '6px' });
+      node.addEventListener('click', event => event.stopPropagation());
+    }
+    miniTransport.append(miniPreviousButton, miniPauseButton, miniNextButton);
 
     const minimizeButton = document.createElement('button');
     minimizeButton.type = 'button';
@@ -852,7 +890,7 @@
       border: '1px solid rgba(255,255,255,.22)', background: 'rgba(255,255,255,.08)', color: 'inherit',
       cursor: 'pointer', font: '700 16px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
-    header.append(title, miniPauseButton, minimizeButton);
+    header.append(title, miniTransport, minimizeButton);
 
     const body = document.createElement('div');
 
@@ -861,16 +899,25 @@
     Object.assign(subtitle.style, { opacity: '0.62', fontSize: '11px', marginTop: '3px', marginBottom: '9px' });
 
     const controls = document.createElement('div');
-    Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
+    Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '8px' });
     controls.append(
       button('Scan folder', () => void discoverFullFolder(), 'scan'),
       button('Stop scan', stopDiscovery, 'stop-scan'),
       button('Shuffle: OFF', toggleShuffle, 'shuffle'),
       button('Repeat: OFF', toggleRepeat, 'repeat'),
       button('Start', () => void startQueue()),
-      button('Pause', () => void togglePause(), 'pause'),
-      button('Next', () => void nextNow()),
       button('Stop', stopPlayback)
+    );
+
+    const transport = document.createElement('div');
+    Object.assign(transport.style, {
+      display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px',
+      marginBottom: '9px', padding: '6px 0', borderTop: '1px solid rgba(255,255,255,.08)', borderBottom: '1px solid rgba(255,255,255,.08)'
+    });
+    transport.append(
+      transportButton('⏮', 'Previous track', () => void previousNow(), 'previous'),
+      transportButton('⏸', 'Pause playback', () => void togglePause(), 'pause'),
+      transportButton('⏭', 'Next track', () => void nextNow(), 'next')
     );
 
     const summary = document.createElement('div');
@@ -918,7 +965,7 @@
     });
     debug.append(debugSummary, logBox);
 
-    body.append(subtitle, controls, summary, status, playback, queue, debug);
+    body.append(subtitle, controls, transport, summary, status, playback, queue, debug);
     panel.append(header, body);
     document.body.appendChild(panel);
     enablePanelDragging(panel, title);
@@ -931,17 +978,18 @@
     const applyMinimizedState = value => {
       minimized = Boolean(value);
       body.style.display = minimized ? 'none' : '';
-      miniPauseButton.style.display = minimized ? '' : 'none';
-      panel.style.width = minimized ? '250px' : '500px';
+      miniTransport.style.display = minimized ? 'flex' : 'none';
+      panel.style.width = minimized ? '210px' : '500px';
       panel.style.maxHeight = minimized ? 'none' : '82vh';
       panel.style.overflow = minimized ? 'hidden' : 'auto';
       panel.style.padding = minimized ? '7px 8px' : '12px';
       panel.style.borderRadius = minimized ? '9px' : '12px';
-      title.textContent = minimized ? '♪ Google Drive Player' : `Google Drive Folder Player ${VERSION}`;
+      title.textContent = minimized ? '♪' : `Google Drive Folder Player ${VERSION}`;
+      title.title = minimized ? 'Google Drive Folder Player — drag to move' : 'Drag to move';
       minimizeButton.textContent = minimized ? '▢' : '−';
       minimizeButton.title = minimized ? 'Restore player' : 'Minimize player';
       minimizeButton.setAttribute('aria-label', minimized ? 'Restore player' : 'Minimize player');
-      updatePauseButtons();
+      updateTransportButtons();
       try {
         sessionStorage.setItem(MINIMIZED_KEY, minimized ? '1' : '0');
       } catch {}

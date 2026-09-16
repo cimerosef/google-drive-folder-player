@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.19
-// @description  Hybrid playback core: direct preloaded MP3 audio with Google Drive Preview fallback for WebM/other media.
+// @version      0.0.23
+// @description  Unified direct MP3/WebM playback with next-track preload, Shuffle/Repeat and Drive Preview fallback for other media.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,9 +13,10 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.19';
+  const VERSION = '0.0.23';
   const PANEL_ID = 'gdfp-probe-panel';
   const REPEAT_MODES = ['off', 'all', 'one'];
+  const DIRECT_EXTENSIONS = new Set(['mp3', 'webm']);
   const MEDIA_EXTENSIONS = [
     'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
     'webm', 'aiff', 'aif', 'm4b', 'mp4'
@@ -39,6 +40,7 @@
   let diagnosticHistory = [];
   let backgroundCloseUnconfirmed = false;
   let playbackKind = 'none';
+  let transitionRequestedAt = 0;
 
   let directCurrent = null;
   let directNext = null;
@@ -93,8 +95,16 @@
     return match?.[1] || '';
   }
 
-  function isDirectMp3(item) {
-    return Boolean(item?.id) && extensionOf(item?.name) === 'mp3';
+  function mediaType(item) {
+    return extensionOf(item?.name);
+  }
+
+  function isDirectMedia(item) {
+    return Boolean(item?.id) && DIRECT_EXTENSIONS.has(mediaType(item));
+  }
+
+  function directLabel(item) {
+    return mediaType(item).toUpperCase() || 'MEDIA';
   }
 
   function findItemRoot(element) {
@@ -152,7 +162,7 @@
     return query && /^\d+$/.test(query) ? query : '0';
   }
 
-  function directMp3Url(item) {
+  function directMediaUrl(item) {
     return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(item.id)}` +
       `&export=download&confirm=t&authuser=${encodeURIComponent(authuserIndex())}`;
   }
@@ -306,6 +316,7 @@
     const seenRoots = new Set();
     const seenKeys = new Set();
     const results = [];
+
     for (const element of candidates) {
       if (isInsidePanel(element)) continue;
       const name = extractMediaName(element);
@@ -330,13 +341,15 @@
     const results = collectFolderRows();
     if (results.length) detectedItems = results;
     renderResults();
-    const directCount = results.filter(isDirectMp3).length;
+    const directCount = results.filter(isDirectMedia).length;
+    const mp3Count = results.filter(item => isDirectMedia(item) && mediaType(item) === 'mp3').length;
+    const webmCount = results.filter(item => isDirectMedia(item) && mediaType(item) === 'webm').length;
     setStatus(
       results.length
-        ? `Scan finished: ${results.length} visible media row(s) cached; ${directCount} direct MP3 candidate(s).`
+        ? `Scan finished: ${results.length} visible media row(s); ${directCount} direct candidate(s) (${mp3Count} MP3, ${webmCount} WebM).`
         : 'No new media rows found. The previous successful scan, if any, is kept.'
     );
-    addDiagnostic(`Scan: ${results.length} live row(s); ${directCount} direct MP3; cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`);
+    addDiagnostic(`Scan: ${results.length} live row(s); ${directCount} direct MP3/WebM; cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`);
     return results;
   }
 
@@ -465,53 +478,75 @@
     hiddenRangeLastMovementAt = 0;
   }
 
-  function disposeAudio(audio) {
-    if (!audio) return;
+  function createDirectElement(item) {
+    const media = mediaType(item) === 'webm' ? document.createElement('video') : new Audio();
+    media.preload = 'auto';
+    media.controls = false;
+    if (mediaType(item) === 'webm') {
+      media.playsInline = true;
+      media.style.display = 'none';
+    }
+    return media;
+  }
+
+  function disposeMedia(media) {
+    if (!media) return;
     try {
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
+      media.pause();
+      media.removeAttribute('src');
+      media.load();
+      media.remove?.();
     } catch {}
   }
 
   function clearDirectNext() {
     if (!directNext) return;
-    disposeAudio(directNext.audio);
+    disposeMedia(directNext.media);
     directNext = null;
   }
 
   function clearDirectCurrent() {
     if (!directCurrent) return;
-    disposeAudio(directCurrent.audio);
+    disposeMedia(directCurrent.media);
     directCurrent = null;
   }
 
-  function clearAllDirectAudio() {
+  function clearAllDirectMedia() {
     clearDirectCurrent();
     clearDirectNext();
   }
 
-  function createDirectAudio(item, index, role) {
-    const audio = new Audio();
-    const slot = { audio, item: { ...item }, index, ready: false, failed: false };
-    audio.preload = 'auto';
-    audio.addEventListener('loadedmetadata', () => addDiagnostic(`${role} direct MP3 metadata: ${index + 1}/${playlist.length} · ${Math.round(audio.duration || 0)}s.`));
-    audio.addEventListener('canplay', () => {
+  function createDirectSlot(item, index, role) {
+    const media = createDirectElement(item);
+    const slot = { media, item: { ...item }, index, role, ready: false, failed: false };
+    const label = directLabel(item);
+
+    media.addEventListener('loadedmetadata', () => {
+      addDiagnostic(`${slot.role} direct ${label} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`);
+    });
+    media.addEventListener('canplay', () => {
       slot.ready = true;
-      if (role === 'next') renderPlaybackState('direct MP3 · next preloaded');
+      if (slot === directNext) renderPlaybackState(`direct ${label} · next preloaded`);
     });
-    audio.addEventListener('error', () => {
+    media.addEventListener('error', () => {
       slot.failed = true;
-      addDiagnostic(`${role} direct MP3 error for ${item.name}; code=${audio.error?.code || 'unknown'}.`);
+      addDiagnostic(`${slot.role} direct ${label} error for ${item.name}; code=${media.error?.code || 'unknown'}.`);
     });
-    audio.addEventListener('waiting', () => addDiagnostic(`${role} direct MP3 waiting: ${item.name}.`));
-    audio.addEventListener('ended', () => {
-      if (directCurrent?.audio !== audio || currentIndex !== index || playbackKind !== 'direct-mp3') return;
-      addDiagnostic(`Direct MP3 ended naturally: track ${index + 1}/${playlist.length}.`);
+    media.addEventListener('waiting', () => addDiagnostic(`${slot.role} direct ${label} waiting: ${item.name}.`));
+    media.addEventListener('playing', () => {
+      if (slot === directCurrent && transitionRequestedAt) {
+        addDiagnostic(`Direct audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
+        transitionRequestedAt = 0;
+      }
+    });
+    media.addEventListener('ended', () => {
+      if (directCurrent !== slot || currentIndex !== index || playbackKind !== 'direct-media') return;
+      addDiagnostic(`Direct ${label} ended naturally: track ${index + 1}/${playlist.length}.`);
       if (autoMode && !advancing) void handleTrackEnd();
     });
-    audio.src = directMp3Url(item);
-    audio.load();
+
+    media.src = directMediaUrl(item);
+    media.load();
     return slot;
   }
 
@@ -524,41 +559,44 @@
 
   function prepareDirectNext() {
     const index = nextIndexForPreload();
-    if (index < 0 || !isDirectMp3(playlist[index])) {
+    if (index < 0 || !isDirectMedia(playlist[index])) {
       clearDirectNext();
       return;
     }
     const item = playlist[index];
     if (directNext && directNext.index === index && directNext.item.id === item.id && !directNext.failed) return;
     clearDirectNext();
-    directNext = createDirectAudio(item, index, 'next');
-    addDiagnostic(`Preloading next direct MP3 ${index + 1}/${playlist.length}: ${item.name}`);
+    directNext = createDirectSlot(item, index, 'next');
+    addDiagnostic(`Preloading next direct ${directLabel(item)} ${index + 1}/${playlist.length}: ${item.name}`);
   }
 
-  async function waitForDirectReady(slot, timeoutMs = 9000) {
-    if (!slot?.audio || slot.failed) return false;
-    if (slot.audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return true;
+  async function waitForDirectReady(slot, timeoutMs = 10000) {
+    if (!slot?.media || slot.failed) return false;
+    if (slot.media.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return true;
     return await new Promise(resolve => {
       let done = false;
       const finish = value => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        slot.audio.removeEventListener('canplay', onCanPlay);
-        slot.audio.removeEventListener('error', onError);
+        slot.media.removeEventListener('canplay', onCanPlay);
+        slot.media.removeEventListener('error', onError);
         resolve(value);
       };
       const onCanPlay = () => finish(true);
       const onError = () => finish(false);
-      const timer = setTimeout(() => finish(slot.audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA), timeoutMs);
-      slot.audio.addEventListener('canplay', onCanPlay, { once: true });
-      slot.audio.addEventListener('error', onError, { once: true });
+      const timer = setTimeout(() => finish(slot.media.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA), timeoutMs);
+      slot.media.addEventListener('canplay', onCanPlay, { once: true });
+      slot.media.addEventListener('error', onError, { once: true });
     });
   }
 
-  async function openDirectMp3Index(index, reason) {
+  async function openDirectMediaIndex(index, reason) {
     const target = playlist[index];
     const previousIndex = currentIndex;
+    const previousKind = playbackKind;
+    const oldCurrent = directCurrent;
+
     if (getPreviewEvidence().open) {
       const closed = await closePreview(document.hidden);
       if (!closed) return false;
@@ -569,42 +607,48 @@
     if (directNext && directNext.index === index && directNext.item.id === target.id && !directNext.failed) {
       slot = directNext;
       directNext = null;
+      slot.role = 'current';
       promoted = true;
-      addDiagnostic(`Promoting preloaded direct MP3 ${index + 1}/${playlist.length}.`);
+      addDiagnostic(`Promoting preloaded direct ${directLabel(target)} ${index + 1}/${playlist.length}.`);
     } else {
-      slot = createDirectAudio(target, index, 'current');
-      addDiagnostic(`Direct MP3 created for ${index + 1}/${playlist.length}: ${target.name}`);
+      slot = createDirectSlot(target, index, 'current');
+      addDiagnostic(`Direct ${directLabel(target)} created for ${index + 1}/${playlist.length}: ${target.name}`);
     }
 
-    const oldCurrent = directCurrent;
     directCurrent = slot;
-    playbackKind = 'direct-mp3';
-    const ready = await waitForDirectReady(slot, promoted ? 5000 : 9000);
+    playbackKind = 'direct-media';
+    const ready = await waitForDirectReady(slot, promoted ? 6000 : 10000);
     if (!ready || slot.failed) {
       if (directCurrent === slot) directCurrent = oldCurrent;
-      disposeAudio(slot.audio);
-      playbackKind = oldCurrent ? 'direct-mp3' : 'none';
-      addDiagnostic(`Direct MP3 not ready; will fall back to Drive Preview: ${target.name}`);
+      disposeMedia(slot.media);
+      playbackKind = oldCurrent ? 'direct-media' : previousKind;
+      addDiagnostic(`Direct ${directLabel(target)} not ready; will try Drive Preview fallback: ${target.name}`);
       return false;
     }
 
+    if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
+    transitionRequestedAt = performance.now();
     try {
-      if (oldCurrent && oldCurrent.audio !== slot.audio) disposeAudio(oldCurrent.audio);
-      await slot.audio.play();
+      await slot.media.play();
     } catch (error) {
-      if (directCurrent === slot) directCurrent = null;
-      disposeAudio(slot.audio);
-      playbackKind = 'none';
+      transitionRequestedAt = 0;
+      if (directCurrent === slot) directCurrent = oldCurrent;
+      disposeMedia(slot.media);
+      playbackKind = oldCurrent ? 'direct-media' : previousKind;
       currentIndex = previousIndex;
-      addDiagnostic(`Direct MP3 play rejected (${error?.name || 'Error'}); falling back to Preview.`);
+      if (oldCurrent?.media && !oldCurrent.media.ended) {
+        try { await oldCurrent.media.play(); } catch {}
+      }
+      addDiagnostic(`Direct ${directLabel(target)} play rejected (${error?.name || 'Error'}); trying Preview fallback.`);
       return false;
     }
 
+    if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
     currentIndex = index;
-    setStatus(`Playing ${index + 1}/${playlist.length} via direct MP3: ${target.name}`);
-    renderPlaybackState(`${reason} · direct MP3${promoted ? ' · preloaded' : ''}`);
+    setStatus(`Playing ${index + 1}/${playlist.length} via direct ${directLabel(target)}: ${target.name}`);
+    renderPlaybackState(`${reason} · direct ${directLabel(target)}${promoted ? ' · preloaded' : ''}`);
     renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Direct MP3 playing ${index + 1}/${playlist.length}${promoted ? ' from preload' : ''}: ${target.name}`);
+    addDiagnostic(`Direct ${directLabel(target)} playing ${index + 1}/${playlist.length}${promoted ? ' from preload' : ''}: ${target.name}`);
     prepareDirectNext();
     startMonitor();
     return true;
@@ -613,7 +657,7 @@
   async function openPreviewIndex(index, reason) {
     const target = playlist[index];
     const previousIndex = currentIndex;
-    clearAllDirectAudio();
+    clearAllDirectMedia();
     playbackKind = 'preview';
     const hiddenTransition = document.hidden;
     if (getPreviewEvidence().open && !(await closePreview(hiddenTransition))) return false;
@@ -700,7 +744,7 @@
     prepareDirectNext();
     if (repeatMode === 'off') setStatus('Repeat is OFF. Playback stops at queue end.');
     else if (repeatMode === 'all') setStatus('Repeat ALL is ON. Current queue wraps to track 1.');
-    else setStatus('Repeat ONE is ON. Natural end repeats the current track.');
+    else setStatus('Repeat ONE is ON. Natural end repeats the current track; Next now still advances.');
   }
 
   async function openPlaylistIndex(index, reason = 'manual') {
@@ -712,16 +756,16 @@
     try {
       const target = playlist[index];
       let opened = false;
-      if (isDirectMp3(target)) {
-        opened = await openDirectMp3Index(index, reason);
+      if (isDirectMedia(target)) {
+        opened = await openDirectMediaIndex(index, reason);
         if (!opened) {
-          addDiagnostic(`Direct MP3 route failed; trying Drive Preview fallback for ${target.name}.`);
+          addDiagnostic(`Direct ${directLabel(target)} route failed; trying Drive Preview fallback for ${target.name}.`);
           opened = await openPreviewIndex(index, `${reason} · direct fallback`);
         }
       } else {
         opened = await openPreviewIndex(index, reason);
       }
-      if (opened) addDiagnostic(`Hybrid transition accepted -> ${index + 1}/${playlist.length} in ${Math.round(performance.now() - started)} ms via ${playbackKind}.`);
+      if (opened) addDiagnostic(`Unified transition accepted -> ${index + 1}/${playlist.length} in ${Math.round(performance.now() - started)} ms via ${playbackKind}.`);
       return opened;
     } finally {
       advancing = false;
@@ -740,9 +784,10 @@
     currentIndex = -1;
     playbackKind = 'none';
     diagnosticHistory = [];
-    clearAllDirectAudio();
+    transitionRequestedAt = 0;
+    clearAllDirectMedia();
     renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Playlist captured: ${playlist.length}; ${playlist.filter(item => item.id).length} stable ids; ${playlist.filter(isDirectMp3).length} direct MP3; mode=${playlistShuffled ? 'shuffle' : 'ordered'}; repeat=${repeatMode}.`);
+    addDiagnostic(`Playlist captured: ${playlist.length}; ${playlist.filter(item => item.id).length} stable ids; ${playlist.filter(isDirectMedia).length} direct MP3/WebM; mode=${playlistShuffled ? 'shuffle' : 'ordered'}; repeat=${repeatMode}.`);
     if (playlistShuffled) addDiagnostic(`Shuffle head: ${playlist.slice(0, 5).map(item => item.name).join(' | ')}`);
     await openPlaylistIndex(0, playlistShuffled ? 'shuffle start' : 'start');
   }
@@ -750,13 +795,14 @@
   function stopContinuousTest() {
     autoMode = false;
     resetProgressTracking();
-    clearAllDirectAudio();
+    transitionRequestedAt = 0;
+    clearAllDirectMedia();
     playbackKind = getPreviewEvidence().open ? 'preview' : 'none';
     if (monitorTimer) {
       clearInterval(monitorTimer);
       monitorTimer = null;
     }
-    setStatus(playbackKind === 'preview' ? 'Continuous stopped. Existing Drive Preview playback was left untouched.' : 'Continuous stopped. Direct MP3 audio was paused and released.');
+    setStatus(playbackKind === 'preview' ? 'Continuous stopped. Existing Drive Preview playback was left untouched.' : 'Continuous stopped. Direct media was paused and released.');
     renderPlaybackState('Stopped');
     renderQueuePreview(playlist, currentIndex);
     addDiagnostic('Continuous playback stopped.');
@@ -788,15 +834,17 @@
   }
 
   async function repeatDirectCurrent() {
-    if (!directCurrent?.audio) return false;
+    if (!directCurrent?.media) return false;
     try {
-      directCurrent.audio.currentTime = 0;
-      await directCurrent.audio.play();
-      setStatus(`Repeat ONE: replaying ${currentIndex + 1}/${playlist.length} via direct MP3.`);
-      renderPlaybackState('Repeat ONE · direct MP3');
-      addDiagnostic(`Repeat ONE restarted direct MP3 track ${currentIndex + 1}.`);
+      directCurrent.media.currentTime = 0;
+      transitionRequestedAt = performance.now();
+      await directCurrent.media.play();
+      setStatus(`Repeat ONE: replaying ${currentIndex + 1}/${playlist.length} via direct ${directLabel(playlist[currentIndex])}.`);
+      renderPlaybackState(`Repeat ONE · direct ${directLabel(playlist[currentIndex])}`);
+      addDiagnostic(`Repeat ONE restarted direct ${directLabel(playlist[currentIndex])} track ${currentIndex + 1}.`);
       return true;
     } catch (error) {
+      transitionRequestedAt = 0;
       addDiagnostic(`Direct Repeat ONE restart failed: ${error?.name || 'Error'}.`);
       return false;
     }
@@ -806,7 +854,7 @@
     if (!autoMode || advancing || currentIndex < 0) return;
     endArmed = false;
     if (repeatMode === 'one') {
-      if (playbackKind === 'direct-mp3' && await repeatDirectCurrent()) return;
+      if (playbackKind === 'direct-media' && await repeatDirectCurrent()) return;
       setStatus(`End detected. Repeating track ${currentIndex + 1}/${playlist.length}…`);
       addDiagnostic('End detected; Repeat ONE reopening current Preview/fallback track.');
       await openPlaylistIndex(currentIndex, 'repeat one');
@@ -836,15 +884,18 @@
 
   function monitorTick() {
     if (!autoMode || advancing || currentIndex < 0) return;
-    if (playbackKind === 'direct-mp3') {
-      const audio = directCurrent?.audio;
-      if (!audio) return;
-      const ratio = Number.isFinite(audio.duration) && audio.duration > 0 ? Math.max(0, Math.min(1, audio.currentTime / audio.duration)) : 0;
+    if (playbackKind === 'direct-media') {
+      const media = directCurrent?.media;
+      if (!media) return;
+      const ratio = Number.isFinite(media.duration) && media.duration > 0
+        ? Math.max(0, Math.min(1, media.currentTime / media.duration))
+        : 0;
       const percent = Math.round(ratio * 1000) / 10;
-      const nextReady = directNext?.ready ? ' · next preloaded' : '';
-      renderPlaybackState(`${percent}% · direct MP3${nextReady}`);
+      const nextReady = directNext?.ready ? ' · next preloaded' : directNext ? ' · next loading' : '';
+      renderPlaybackState(`${percent}% · direct ${directLabel(playlist[currentIndex])}${nextReady}`);
       return;
     }
+
     if (playbackKind !== 'preview') return;
     const progress = getProgressState();
     if (!progress) {
@@ -867,14 +918,29 @@
     monitorTimer = setInterval(monitorTick, 250);
   }
 
+  function seekCurrentToLast5s() {
+    if (playbackKind !== 'direct-media' || !directCurrent?.media) {
+      setStatus('Seek test only applies while a direct MP3/WebM track is playing.');
+      return;
+    }
+    const media = directCurrent.media;
+    if (!Number.isFinite(media.duration) || media.duration <= 6) {
+      setStatus('Current direct media duration is not ready yet.');
+      return;
+    }
+    media.currentTime = Math.max(0, media.duration - 5);
+    addDiagnostic(`Seeked current direct ${directLabel(playlist[currentIndex])} to last ~5 seconds (${media.currentTime.toFixed(1)}/${media.duration.toFixed(1)}).`);
+  }
+
   function probeTransition() {
     const evidence = getPreviewEvidence();
     const close = evidence.close || findTopLeftCloseControl();
     const title = evidence.titleName || '(none)';
     const progress = evidence.progress ? `${Math.round(evidence.progress.ratio * 1000) / 10}% [${evidence.progress.min}..${evidence.progress.max}] via ${evidence.progress.source}` : '(none)';
-    const direct = directCurrent?.audio ? `${directCurrent.audio.currentTime.toFixed(1)}/${Number.isFinite(directCurrent.audio.duration) ? directCurrent.audio.duration.toFixed(1) : 'n/a'}s` : '(none)';
+    const media = directCurrent?.media;
+    const direct = media ? `${mediaType(directCurrent.item).toUpperCase()} ${media.currentTime.toFixed(1)}/${Number.isFinite(media.duration) ? media.duration.toFixed(1) : 'n/a'}s` : '(none)';
     const closeDesc = close ? `${close.tagName.toLowerCase()} label="${close.getAttribute('aria-label') || close.getAttribute('title') || '(none)'}"` : '(none)';
-    addDiagnostic(`Probe -> engine=${playbackKind}; direct=${direct}; previewOpen=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`);
+    addDiagnostic(`Probe -> engine=${playbackKind}; direct=${direct}; next=${directNext ? `${directLabel(directNext.item)}:${directNext.ready ? 'ready' : 'loading'}` : '(none)'}; previewOpen=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`);
   }
 
   function setStatus(text) {
@@ -885,7 +951,7 @@
   function addDiagnostic(text) {
     const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     diagnosticHistory.push(`${stamp}  ${text}`);
-    diagnosticHistory = diagnosticHistory.slice(-10);
+    diagnosticHistory = diagnosticHistory.slice(-12);
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="diagnostic"]`);
     if (node) node.textContent = diagnosticHistory.join('\n');
     log(text);
@@ -914,7 +980,9 @@
     if (!box) return;
     const name = currentIndex >= 0 && playlist[currentIndex] ? playlist[currentIndex].name : '—';
     const position = currentIndex >= 0 && playlist.length ? `${currentIndex + 1}/${playlist.length}` : '—';
-    const engine = playbackKind === 'direct-mp3' ? 'DIRECT MP3' : playbackKind === 'preview' ? 'DRIVE PREVIEW' : '—';
+    let engine = '—';
+    if (playbackKind === 'direct-media' && currentIndex >= 0) engine = `DIRECT ${directLabel(playlist[currentIndex])}`;
+    else if (playbackKind === 'preview') engine = 'DRIVE PREVIEW';
     box.textContent = `Continuous: ${autoMode ? 'ON' : 'OFF'} | Mode: ${(playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED'} | Repeat: ${repeatMode.toUpperCase()} | Engine: ${engine} | Track: ${position} | ${detail}\n${name}`;
   }
 
@@ -931,7 +999,7 @@
     const lines = [`Queue ${mode}: ${queue.length} track(s) · Repeat ${repeatMode.toUpperCase()}`];
     const end = Math.min(queue.length, start + 7);
     for (let i = start; i < end; i += 1) {
-      const engine = isDirectMp3(queue[i]) ? 'MP3' : 'Preview';
+      const engine = isDirectMedia(queue[i]) ? directLabel(queue[i]) : 'Preview';
       lines.push(`${i === activeIndex ? '▶' : ' '} ${i + 1}. [${engine}] ${queue[i].name}`);
     }
     if (end < queue.length) lines.push(`… +${queue.length - end} later`);
@@ -942,12 +1010,14 @@
     const count = document.querySelector(`#${PANEL_ID} [data-gdfp="count"]`);
     const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
     if (!count || !list) return;
-    const directCount = detectedItems.filter(isDirectMp3).length;
-    count.textContent = `${detectedItems.length} cached visible media item(s) · ${directCount} direct MP3`;
+    const directCount = detectedItems.filter(isDirectMedia).length;
+    const mp3Count = detectedItems.filter(item => isDirectMedia(item) && mediaType(item) === 'mp3').length;
+    const webmCount = detectedItems.filter(item => isDirectMedia(item) && mediaType(item) === 'webm').length;
+    count.textContent = `${detectedItems.length} cached visible media item(s) · ${directCount} direct (${mp3Count} MP3 + ${webmCount} WebM)`;
     list.replaceChildren();
     for (const item of detectedItems.slice(0, 8)) {
       const row = document.createElement('div');
-      row.textContent = `${isDirectMp3(item) ? '[MP3]' : '[Preview]'} ${item.name}`;
+      row.textContent = `${isDirectMedia(item) ? `[${directLabel(item)}]` : '[Preview]'} ${item.name}`;
       row.title = item.name;
       Object.assign(row.style, { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' });
       list.appendChild(row);
@@ -1034,7 +1104,7 @@
     if (document.getElementById(PANEL_ID)) return;
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
-    Object.assign(panel.style, { position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '480px', maxHeight: '84vh', overflow: 'auto', boxSizing: 'border-box', padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)', color: '#f1f3f4', boxShadow: '0 8px 30px rgba(0,0,0,.32)', font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif' });
+    Object.assign(panel.style, { position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '500px', maxHeight: '84vh', overflow: 'auto', boxSizing: 'border-box', padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)', color: '#f1f3f4', boxShadow: '0 8px 30px rgba(0,0,0,.32)', font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif' });
 
     const title = document.createElement('div');
     title.textContent = `Google Drive Folder Player — Probe ${VERSION}`;
@@ -1043,7 +1113,7 @@
 
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Scan the folder, choose Shuffle/Repeat, then start hybrid playback.';
+    status.textContent = 'Ready. Scan the folder, choose Shuffle/Repeat, then start unified direct playback.';
     status.style.marginBottom = '9px';
 
     const controls = document.createElement('div');
@@ -1052,8 +1122,9 @@
       makeButton('Scan folder view', scanCurrentView),
       makeButton('Shuffle: OFF', toggleShuffle, 'shuffle-toggle'),
       makeButton('Repeat: OFF', toggleRepeat, 'repeat-toggle'),
-      makeButton('Start hybrid test', startContinuousTest),
+      makeButton('Start direct player', startContinuousTest),
       makeButton('Next now', nextNow),
+      makeButton('Seek last 5s', seekCurrentToLast5s),
       makeButton('Stop', stopContinuousTest),
       makeButton('Probe transition', probeTransition)
     );
@@ -1084,7 +1155,7 @@
     Object.assign(list.style, { display: 'grid', gap: '2px' });
 
     const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.19 is the first hybrid integration build. MP3 files with stable Drive IDs use direct Audio + next-track preload; WebM and all other media keep the validated Drive Preview fallback. Shuffle, Repeat and draggable panel remain active. Full-folder discovery is intentionally not addressed yet.';
+    note.textContent = 'Probe 0.0.23 integrates the validated Direct Media Core into the full player. MP3 and WebM with stable Drive IDs use direct media + one-track preload with no Drive Preview. Other supported media formats retain the validated Drive Preview fallback. Shuffle, Repeat, Next, draggable panel and background playback remain active. Full-folder discovery is intentionally still out of scope.';
     Object.assign(note.style, { marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)', opacity: '0.65', fontSize: '11px' });
 
     panel.append(title, status, controls, playback, queue, diagnostic, count, list, note);
@@ -1092,7 +1163,7 @@
     enablePanelDragging(panel, title);
     updateShuffleButton();
     updateRepeatButton();
-    log(`Probe ${VERSION} mounted. Hybrid playback ready; authuser=${authuserIndex()}.`);
+    log(`Probe ${VERSION} mounted. Unified direct player ready; authuser=${authuserIndex()}.`);
   }
 
   function init() {

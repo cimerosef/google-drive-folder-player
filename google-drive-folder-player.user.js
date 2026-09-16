@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Google Drive Folder Player - Probe
+// @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.24
-// @description  Full-folder MP3/WebM discovery with direct playback, preload, Shuffle/Repeat and background-safe handoff.
+// @version      0.0.25
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.24';
+  const VERSION = '0.0.25';
   const PANEL_ID = 'gdfp-probe-panel';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
   const REPEAT_MODES = ['off', 'all', 'one'];
@@ -204,21 +204,33 @@
 
   function renderDiscoverySummary() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="summary"]`);
-    if (!node) return;
-    const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
-    const webm = discoveredItems.filter(item => item.type === 'webm').length;
-    node.textContent = `${discoveryRunning ? 'DISCOVERING' : 'READY'} | ${discoveredItems.length} full-folder item(s) | ${mp3} MP3 | ${webm} WebM`;
+    if (node) {
+      const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
+      const webm = discoveredItems.filter(item => item.type === 'webm').length;
+      if (discoveryRunning) node.textContent = `Scanning… ${discoveredItems.length || '—'} cached track(s)`;
+      else if (discoveredItems.length) node.textContent = `${discoveredItems.length} tracks · ${mp3} MP3 · ${webm} WebM`;
+      else node.textContent = 'Folder not scanned yet';
+    }
+
+    const scanButton = document.querySelector(`#${PANEL_ID} [data-gdfp="scan"]`);
+    const stopScanButton = document.querySelector(`#${PANEL_ID} [data-gdfp="stop-scan"]`);
+    if (scanButton) {
+      scanButton.disabled = discoveryRunning || autoMode;
+      scanButton.style.opacity = scanButton.disabled ? '0.55' : '1';
+      scanButton.style.cursor = scanButton.disabled ? 'default' : 'pointer';
+    }
+    if (stopScanButton) stopScanButton.style.display = discoveryRunning ? '' : 'none';
   }
 
   async function discoverFullFolder() {
     if (discoveryRunning || autoMode) {
-      if (autoMode) setStatus('Stop playback before running full-folder discovery.');
+      if (autoMode) setStatus('Stop playback before scanning the folder again.');
       return false;
     }
 
     const scroller = findScrollContainer();
     if (!scroller) {
-      setStatus('Could not identify the Drive folder scroll container.');
+      setStatus('Could not identify the Drive folder list.');
       log('Discovery aborted: no scroll container found.');
       return false;
     }
@@ -255,7 +267,7 @@
       noMovementRounds = Math.abs(currentTop - lastTop) < 2 ? noMovementRounds + 1 : 0;
       noNewRounds = sample.added === 0 ? noNewRounds + 1 : 0;
       lastTop = currentTop;
-      setStatus(`Discovering full folder… ${found.size} unique item(s), step ${steps}.`);
+      setStatus(`Scanning folder… ${found.size} track(s) found.`);
       log(`Step ${steps}: top=${Math.round(currentTop)}/${Math.round(currentRange)}, rendered=${sample.rows.length}, +${sample.added}, unique=${found.size}${atBottom ? ' · bottom' : ''}.`);
 
       if (atBottom) {
@@ -282,10 +294,10 @@
       discoveredItems = [...found.values()];
       const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
       const webm = discoveredItems.filter(item => item.type === 'webm').length;
-      setStatus(`Full-folder discovery complete: ${discoveredItems.length} item(s) (${mp3} MP3, ${webm} WebM).`);
+      setStatus(`Folder ready: ${discoveredItems.length} tracks (${mp3} MP3, ${webm} WebM).`);
       log(`Discovery completed: ${discoveredItems.length} unique item(s): ${mp3} MP3, ${webm} WebM; steps=${steps}.`);
     } else if (stopped) {
-      setStatus(`Discovery stopped; previous complete result kept (${discoveredItems.length} item(s)).`);
+      setStatus(`Scan stopped; previous complete result kept (${discoveredItems.length} tracks).`);
       log(`Discovery stopped by user at ${found.size} temporary item(s); previous complete result preserved.`);
     }
 
@@ -299,6 +311,7 @@
   function stopDiscovery() {
     if (!discoveryRunning) return;
     stopDiscoveryRequested = true;
+    setStatus('Stopping scan…');
     log('Stop discovery requested.');
   }
 
@@ -450,7 +463,7 @@
       if (!ready || slot.failed) {
         if (directCurrent === slot) directCurrent = oldCurrent;
         disposeMedia(slot.media);
-        setStatus(`Direct media failed to become ready: ${target.name}`);
+        setStatus(`Track could not be loaded: ${target.name}`);
         return false;
       }
 
@@ -459,7 +472,7 @@
       await slot.media.play();
       if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
       currentIndex = index;
-      setStatus(`Playing ${index + 1}/${playlist.length} [${labelOf(target)}]${promoted ? ' from preload' : ''}: ${target.name}`);
+      setStatus(`Playing ${index + 1}/${playlist.length}${promoted ? ' · preloaded' : ''}: ${target.name}`);
       log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promoted ? ' from preload' : ''}.`);
       prepareNext();
       renderPlayback();
@@ -469,7 +482,7 @@
       transitionRequestedAt = 0;
       if (slot && directCurrent === slot) directCurrent = oldCurrent;
       if (slot) disposeMedia(slot.media);
-      setStatus(`play() failed: ${error?.name || 'Error'}`);
+      setStatus(`Playback failed: ${error?.name || 'Error'}`);
       log(`play() failed for ${target.name}: ${error?.name || 'Error'}.`);
       return false;
     } finally {
@@ -500,6 +513,7 @@
     playlist = buildPlaylist();
     currentIndex = -1;
     autoMode = true;
+    renderDiscoverySummary();
     log(`Queue built: ${playlist.length} track(s), mode=${shuffleMode ? 'SHUFFLE' : 'ORDERED'}, repeat=${repeatMode.toUpperCase()}.`);
     renderQueue();
     await playIndex(0, 'start');
@@ -507,7 +521,7 @@
 
   async function nextNow() {
     if (!playlist.length) {
-      setStatus('Start a queue first.');
+      setStatus('Start playback first.');
       return;
     }
     autoMode = true;
@@ -515,21 +529,11 @@
     if (next >= playlist.length) {
       if (repeatMode === 'all') next = 0;
       else {
-        setStatus('Queue end reached.');
+        setStatus('End of queue.');
         return;
       }
     }
-    await playIndex(next, 'Next now');
-  }
-
-  function seekLast5s() {
-    const media = directCurrent?.media;
-    if (!media || !Number.isFinite(media.duration) || media.duration <= 6) {
-      setStatus('Current media duration is not ready.');
-      return;
-    }
-    media.currentTime = media.duration - 5;
-    log(`Seeked current track to last ~5 seconds (${media.currentTime.toFixed(1)}/${media.duration.toFixed(1)}).`);
+    await playIndex(next, 'Next');
   }
 
   async function repeatCurrent() {
@@ -558,8 +562,9 @@
       else {
         autoMode = false;
         clearNext();
-        setStatus(`Queue finished (${playlist.length} track(s)).`);
+        setStatus(`Queue finished (${playlist.length} tracks).`);
         renderPlayback();
+        renderDiscoverySummary();
         return;
       }
     }
@@ -572,12 +577,13 @@
     clearMedia();
     setStatus('Playback stopped.');
     renderPlayback();
+    renderDiscoverySummary();
   }
 
   function toggleShuffle() {
     shuffleMode = !shuffleMode;
     updateButtons();
-    setStatus(`Shuffle ${shuffleMode ? 'ON' : 'OFF'}; applies when the queue is rebuilt.`);
+    setStatus(`Shuffle ${shuffleMode ? 'ON' : 'OFF'}; applies next time the queue is started.`);
   }
 
   function toggleRepeat() {
@@ -604,15 +610,15 @@
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="playback"]`);
     if (!node) return;
     if (currentIndex < 0 || !playlist[currentIndex]) {
-      node.textContent = `Playback: OFF | Queue: ${playlist.length || 0}`;
+      node.textContent = playlist.length ? `Stopped · ${playlist.length}-track queue` : 'Not playing';
       return;
     }
     const current = playlist[currentIndex];
     const media = directCurrent?.media;
     const ratio = media && Number.isFinite(media.duration) && media.duration > 0 ? media.currentTime / media.duration : 0;
     const percent = Math.round(Math.max(0, Math.min(1, ratio)) * 1000) / 10;
-    const preload = directNext ? (directNext.ready ? 'next preloaded' : 'next loading') : 'no next preload';
-    node.textContent = `${autoMode ? 'ON' : 'PAUSED'} | ${currentIndex + 1}/${playlist.length} | ${labelOf(current)} | ${percent}% | ${preload}\n${current.name}`;
+    const preload = directNext ? (directNext.ready ? 'next ready' : 'next loading') : 'no preload';
+    node.textContent = `${autoMode ? '▶' : '■'} ${currentIndex + 1}/${playlist.length} · ${labelOf(current)} · ${percent}% · ${preload}\n${current.name}`;
   }
 
   function renderQueue() {
@@ -620,15 +626,15 @@
     if (!node) return;
     if (!playlist.length) {
       node.textContent = discoveredItems.length
-        ? `Full-folder cache ready: ${discoveredItems.length} item(s). Build a queue to play.`
-        : 'No full-folder cache yet.';
+        ? `${discoveredItems.length} tracks ready. Press Start.`
+        : 'Scan the folder to build the library.';
       return;
     }
     const start = currentIndex >= 0 ? currentIndex : 0;
-    const end = Math.min(playlist.length, start + 6);
-    const lines = [`Queue: ${playlist.length} track(s) · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()}`];
+    const end = Math.min(playlist.length, start + 5);
+    const lines = [`${playlist.length} tracks · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()}`];
     for (let i = start; i < end; i += 1) lines.push(`${i === currentIndex ? '▶' : ' '} ${i + 1}. [${labelOf(playlist[i])}] ${playlist[i].name}`);
-    if (end < playlist.length) lines.push(`… +${playlist.length - end} later`);
+    if (end < playlist.length) lines.push(`… +${playlist.length - end} more`);
     node.textContent = lines.join('\n');
   }
 
@@ -718,74 +724,81 @@
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
     Object.assign(panel.style, {
-      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '540px', maxHeight: '84vh',
+      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '500px', maxHeight: '82vh',
       overflow: 'auto', boxSizing: 'border-box', padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)',
       color: '#f1f3f4', border: '1px solid rgba(255,255,255,.18)', boxShadow: '0 8px 30px rgba(0,0,0,.32)',
       font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
 
     const title = document.createElement('div');
-    title.textContent = `Google Drive Folder Player — Probe ${VERSION}`;
-    title.title = 'Drag this title bar to move the panel';
+    title.textContent = `Google Drive Folder Player ${VERSION}`;
+    title.title = 'Drag to move';
     Object.assign(title.style, {
-      fontWeight: '650', marginBottom: '7px', cursor: 'grab', userSelect: 'none', touchAction: 'none'
+      fontWeight: '700', marginBottom: '2px', cursor: 'grab', userSelect: 'none', touchAction: 'none'
     });
 
-    const note = document.createElement('div');
-    note.textContent = '0.0.24 integrates verified full-folder MP3/WebM discovery with the validated direct-media/preload player. The current Music-folder baseline is 160 files (144 MP3 + 16 WebM).';
-    note.style.opacity = '0.78';
-    note.style.marginBottom = '8px';
+    const subtitle = document.createElement('div');
+    subtitle.textContent = 'Direct MP3/WebM · full-folder queue';
+    Object.assign(subtitle.style, { opacity: '0.62', fontSize: '11px', marginBottom: '9px' });
 
     const controls = document.createElement('div');
     Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
     controls.append(
-      button('Discover full folder', () => void discoverFullFolder()),
-      button('Stop discovery', stopDiscovery),
+      button('Scan folder', () => void discoverFullFolder(), 'scan'),
+      button('Stop scan', stopDiscovery, 'stop-scan'),
       button('Shuffle: OFF', toggleShuffle, 'shuffle'),
       button('Repeat: OFF', toggleRepeat, 'repeat'),
-      button('Start full queue', () => void startQueue()),
-      button('Next now', () => void nextNow()),
-      button('Seek last 5s', seekLast5s),
-      button('Stop playback', stopPlayback)
+      button('Start', () => void startQueue()),
+      button('Next', () => void nextNow()),
+      button('Stop', stopPlayback)
     );
 
     const summary = document.createElement('div');
     summary.dataset.gdfp = 'summary';
     Object.assign(summary.style, {
-      marginBottom: '8px', padding: '8px', borderRadius: '7px',
+      marginBottom: '7px', padding: '7px 8px', borderRadius: '7px',
       background: 'rgba(129,201,149,.10)', border: '1px solid rgba(129,201,149,.20)'
     });
 
     const status = document.createElement('div');
     status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Discover the full folder, choose Shuffle/Repeat, then start the full queue.';
+    status.textContent = 'Ready.';
     Object.assign(status.style, {
-      marginBottom: '8px', padding: '8px', borderRadius: '7px',
+      marginBottom: '7px', padding: '7px 8px', borderRadius: '7px',
       background: 'rgba(129,201,149,.10)', border: '1px solid rgba(129,201,149,.20)'
     });
 
     const playback = document.createElement('div');
     playback.dataset.gdfp = 'playback';
     Object.assign(playback.style, {
-      marginBottom: '8px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      marginBottom: '7px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
       background: 'rgba(138,180,248,.10)', border: '1px solid rgba(138,180,248,.22)', overflowWrap: 'anywhere'
     });
 
     const queue = document.createElement('div');
     queue.dataset.gdfp = 'queue';
     Object.assign(queue.style, {
-      marginBottom: '8px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      marginBottom: '7px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
       background: 'rgba(251,188,4,.08)', border: '1px solid rgba(251,188,4,.20)', overflowWrap: 'anywhere', fontSize: '11px'
     });
+
+    const debug = document.createElement('details');
+    Object.assign(debug.style, {
+      borderTop: '1px solid rgba(255,255,255,.12)', paddingTop: '7px', marginTop: '2px'
+    });
+    const debugSummary = document.createElement('summary');
+    debugSummary.textContent = 'Debug details';
+    Object.assign(debugSummary.style, { cursor: 'pointer', opacity: '0.68', userSelect: 'none', fontSize: '11px' });
 
     const logBox = document.createElement('div');
     logBox.dataset.gdfp = 'log';
     Object.assign(logBox.style, {
-      whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', padding: '8px', borderRadius: '7px',
-      background: 'rgba(138,180,248,.10)', border: '1px solid rgba(138,180,248,.22)', minHeight: '160px', fontSize: '11px'
+      marginTop: '7px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', padding: '8px', borderRadius: '7px',
+      background: 'rgba(138,180,248,.08)', border: '1px solid rgba(138,180,248,.18)', maxHeight: '180px', overflow: 'auto', fontSize: '10px'
     });
+    debug.append(debugSummary, logBox);
 
-    panel.append(title, note, controls, summary, status, playback, queue, logBox);
+    panel.append(title, subtitle, controls, summary, status, playback, queue, debug);
     document.body.appendChild(panel);
     enablePanelDragging(panel, title);
     renderDiscoverySummary();
@@ -793,7 +806,7 @@
     renderQueue();
     updateButtons();
     setInterval(renderPlayback, 300);
-    log(`Probe ${VERSION} mounted; full-folder direct player ready; authuser=${authuserIndex()}.`);
+    log(`Version ${VERSION} mounted; full-folder direct player ready; authuser=${authuserIndex()}.`);
   }
 
   function init() {

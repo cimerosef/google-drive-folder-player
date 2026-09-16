@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.25
+// @version      0.0.26
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,8 +13,9 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.25';
+  const VERSION = '0.0.26';
   const PANEL_ID = 'gdfp-probe-panel';
+  const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
   const REPEAT_MODES = ['off', 'all', 'one'];
   const STEP_SETTLE_MS = 360;
@@ -730,16 +731,36 @@
       font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
 
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      display: 'flex', alignItems: 'center', gap: '8px', minHeight: '24px'
+    });
+
     const title = document.createElement('div');
     title.textContent = `Google Drive Folder Player ${VERSION}`;
     title.title = 'Drag to move';
     Object.assign(title.style, {
-      fontWeight: '700', marginBottom: '2px', cursor: 'grab', userSelect: 'none', touchAction: 'none'
+      flex: '1 1 auto', minWidth: '0', fontWeight: '700', cursor: 'grab', userSelect: 'none', touchAction: 'none',
+      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
     });
+
+    const minimizeButton = document.createElement('button');
+    minimizeButton.type = 'button';
+    minimizeButton.textContent = '−';
+    minimizeButton.title = 'Minimize player';
+    minimizeButton.setAttribute('aria-label', 'Minimize player');
+    Object.assign(minimizeButton.style, {
+      flex: '0 0 auto', width: '28px', height: '26px', padding: '0', borderRadius: '6px',
+      border: '1px solid rgba(255,255,255,.22)', background: 'rgba(255,255,255,.08)', color: 'inherit',
+      cursor: 'pointer', font: '700 16px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+    });
+    header.append(title, minimizeButton);
+
+    const body = document.createElement('div');
 
     const subtitle = document.createElement('div');
     subtitle.textContent = 'Direct MP3/WebM · full-folder queue';
-    Object.assign(subtitle.style, { opacity: '0.62', fontSize: '11px', marginBottom: '9px' });
+    Object.assign(subtitle.style, { opacity: '0.62', fontSize: '11px', marginTop: '3px', marginBottom: '9px' });
 
     const controls = document.createElement('div');
     Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
@@ -798,14 +819,53 @@
     });
     debug.append(debugSummary, logBox);
 
-    panel.append(title, subtitle, controls, summary, status, playback, queue, debug);
+    body.append(subtitle, controls, summary, status, playback, queue, debug);
+    panel.append(header, body);
     document.body.appendChild(panel);
     enablePanelDragging(panel, title);
+
+    let minimized = false;
+    try {
+      minimized = sessionStorage.getItem(MINIMIZED_KEY) === '1';
+    } catch {}
+
+    const applyMinimizedState = value => {
+      minimized = Boolean(value);
+      body.style.display = minimized ? 'none' : '';
+      panel.style.width = minimized ? '220px' : '500px';
+      panel.style.maxHeight = minimized ? 'none' : '82vh';
+      panel.style.overflow = minimized ? 'hidden' : 'auto';
+      panel.style.padding = minimized ? '7px 8px' : '12px';
+      panel.style.borderRadius = minimized ? '9px' : '12px';
+      title.textContent = minimized ? '♪ Google Drive Player' : `Google Drive Folder Player ${VERSION}`;
+      minimizeButton.textContent = minimized ? '▢' : '−';
+      minimizeButton.title = minimized ? 'Restore player' : 'Minimize player';
+      minimizeButton.setAttribute('aria-label', minimized ? 'Restore player' : 'Minimize player');
+      try {
+        sessionStorage.setItem(MINIMIZED_KEY, minimized ? '1' : '0');
+      } catch {}
+
+      if (panel.dataset.gdfpDragged === 'true') {
+        requestAnimationFrame(() => {
+          const rect = panel.getBoundingClientRect();
+          const position = clampPanelPosition(panel, rect.left, rect.top);
+          panel.style.left = `${position.left}px`;
+          panel.style.top = `${position.top}px`;
+        });
+      }
+    };
+
+    minimizeButton.addEventListener('click', event => {
+      event.stopPropagation();
+      applyMinimizedState(!minimized);
+    });
+
     renderDiscoverySummary();
     renderPlayback();
     renderQueue();
     updateButtons();
     setInterval(renderPlayback, 300);
+    applyMinimizedState(minimized);
     log(`Version ${VERSION} mounted; full-folder direct player ready; authuser=${authuserIndex()}.`);
   }
 

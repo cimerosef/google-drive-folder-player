@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Direct Media Core Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.1
+// @version      0.0.2
 // @description  Mixed MP3/WebM direct-media queue with next-track preload and no Google Drive Preview.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.1';
+  const VERSION = '0.0.2';
   const PANEL_ID = 'gdfp-direct-media-core-probe';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
 
@@ -182,13 +182,13 @@
     }
   }
 
-  function attachEvents(slot, role) {
+  function attachEvents(slot) {
     const { media, item, index } = slot;
     for (const eventName of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting', 'stalled', 'suspend', 'ended', 'error']) {
       media.addEventListener(eventName, () => {
         const duration = Number.isFinite(media.duration) ? media.duration.toFixed(1) : 'n/a';
         const error = media.error ? ` errorCode=${media.error.code}` : '';
-        log(`${role} ${index + 1}/${queue.length} ${item.type.toUpperCase()} ${eventName}: ready=${media.readyState} net=${media.networkState} paused=${media.paused} t=${media.currentTime.toFixed(1)}/${duration} buffered=${bufferedText(media)}${error}`);
+        log(`${slot.role} ${index + 1}/${queue.length} ${item.type.toUpperCase()} ${eventName}: ready=${media.readyState} net=${media.networkState} paused=${media.paused} t=${media.currentTime.toFixed(1)}/${duration} buffered=${bufferedText(media)}${error}`);
 
         if (eventName === 'canplay') {
           slot.ready = true;
@@ -196,11 +196,11 @@
         }
         if (eventName === 'error') slot.failed = true;
 
-        if (role === 'current' && eventName === 'ended' && currentSlot === slot && currentIndex === index) {
+        if (eventName === 'ended' && currentSlot === slot && currentIndex === index) {
           if (autoMode && !advancing) void advanceTo(index + 1, 'natural end');
         }
 
-        if (role === 'current' && eventName === 'playing' && transitionRequestedAt) {
+        if (eventName === 'playing' && currentSlot === slot && currentIndex === index && transitionRequestedAt) {
           log(`Transition audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
           transitionRequestedAt = 0;
         }
@@ -210,8 +210,8 @@
 
   function createSlot(item, index, role) {
     const media = createElementFor(item);
-    const slot = { media, item: { ...item }, index, ready: false, failed: false };
-    attachEvents(slot, role);
+    const slot = { media, item: { ...item }, index, role, ready: false, failed: false };
+    attachEvents(slot);
     media.src = directUrl(item);
     media.load();
     log(`${role} preload requested: ${index + 1}/${queue.length} [${item.type.toUpperCase()}] ${item.name}`);
@@ -265,12 +265,14 @@
 
   async function playSlotAsCurrent(slot, index, reason, promoted) {
     const old = currentSlot;
+    slot.role = 'current';
     currentSlot = slot;
     currentIndex = index;
     const ready = await waitReady(slot, promoted ? 6000 : 10000);
     if (!ready || slot.failed) {
       log(`Target failed to become ready: ${queue[index]?.name || 'unknown'}.`);
       currentSlot = old;
+      if (old) old.role = 'current';
       return false;
     }
 
@@ -308,6 +310,7 @@
         slot = nextSlot;
         nextSlot = null;
         promoted = true;
+        slot.role = 'current';
         log(`Promoting preloaded track ${index + 1}/${queue.length}.`);
       } else {
         slot = createSlot(queue[index], index, 'current');

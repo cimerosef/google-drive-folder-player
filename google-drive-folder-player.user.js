@@ -2,7 +2,7 @@
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
 // @version      0.0.26
-// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Shuffle and Repeat.
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Pause, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -203,6 +203,10 @@
     if (node) node.textContent = text;
   }
 
+  function currentMediaIsActive() {
+    return Boolean(directCurrent?.media && !directCurrent.media.ended);
+  }
+
   function renderDiscoverySummary() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="summary"]`);
     if (node) {
@@ -216,7 +220,7 @@
     const scanButton = document.querySelector(`#${PANEL_ID} [data-gdfp="scan"]`);
     const stopScanButton = document.querySelector(`#${PANEL_ID} [data-gdfp="stop-scan"]`);
     if (scanButton) {
-      scanButton.disabled = discoveryRunning || autoMode;
+      scanButton.disabled = discoveryRunning || currentMediaIsActive();
       scanButton.style.opacity = scanButton.disabled ? '0.55' : '1';
       scanButton.style.cursor = scanButton.disabled ? 'default' : 'pointer';
     }
@@ -224,8 +228,8 @@
   }
 
   async function discoverFullFolder() {
-    if (discoveryRunning || autoMode) {
-      if (autoMode) setStatus('Stop playback before scanning the folder again.');
+    if (discoveryRunning || currentMediaIsActive()) {
+      if (currentMediaIsActive()) setStatus('Stop playback before scanning the folder again.');
       return false;
     }
 
@@ -385,6 +389,14 @@
         log(`Audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
         transitionRequestedAt = 0;
       }
+      if (slot === directCurrent) {
+        autoMode = true;
+        updatePauseButtons();
+        renderDiscoverySummary();
+      }
+    });
+    media.addEventListener('pause', () => {
+      if (slot === directCurrent && !media.ended) updatePauseButtons();
     });
     media.addEventListener('ended', () => {
       if (directCurrent !== slot || currentIndex !== index) return;
@@ -470,6 +482,7 @@
 
       if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
       transitionRequestedAt = performance.now();
+      autoMode = true;
       await slot.media.play();
       if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
       currentIndex = index;
@@ -478,13 +491,16 @@
       prepareNext();
       renderPlayback();
       renderQueue();
+      renderDiscoverySummary();
       return true;
     } catch (error) {
       transitionRequestedAt = 0;
       if (slot && directCurrent === slot) directCurrent = oldCurrent;
       if (slot) disposeMedia(slot.media);
+      if (!oldCurrent) autoMode = false;
       setStatus(`Playback failed: ${error?.name || 'Error'}`);
       log(`play() failed for ${target.name}: ${error?.name || 'Error'}.`);
+      updatePauseButtons();
       return false;
     } finally {
       advancing = false;
@@ -537,6 +553,43 @@
     await playIndex(next, 'Next');
   }
 
+  async function togglePause() {
+    const media = directCurrent?.media;
+    const item = playlist[currentIndex];
+    if (!media || !item || media.ended) {
+      setStatus('Nothing is currently available to pause or resume.');
+      updatePauseButtons();
+      return;
+    }
+
+    if (!media.paused) {
+      transitionRequestedAt = 0;
+      media.pause();
+      autoMode = false;
+      setStatus(`Paused ${currentIndex + 1}/${playlist.length}: ${item.name}`);
+      log(`Paused track ${currentIndex + 1}/${playlist.length}.`);
+      updatePauseButtons();
+      renderPlayback();
+      renderDiscoverySummary();
+      return;
+    }
+
+    try {
+      autoMode = true;
+      await media.play();
+      setStatus(`Resumed ${currentIndex + 1}/${playlist.length}: ${item.name}`);
+      log(`Resumed track ${currentIndex + 1}/${playlist.length}.`);
+      prepareNext();
+    } catch (error) {
+      autoMode = false;
+      setStatus(`Resume failed: ${error?.name || 'Error'}`);
+      log(`Resume failed for ${item.name}: ${error?.name || 'Error'}.`);
+    }
+    updatePauseButtons();
+    renderPlayback();
+    renderDiscoverySummary();
+  }
+
   async function repeatCurrent() {
     const media = directCurrent?.media;
     if (!media) return false;
@@ -566,6 +619,7 @@
         setStatus(`Queue finished (${playlist.length} tracks).`);
         renderPlayback();
         renderDiscoverySummary();
+        updatePauseButtons();
         return;
       }
     }
@@ -579,6 +633,7 @@
     setStatus('Playback stopped.');
     renderPlayback();
     renderDiscoverySummary();
+    updatePauseButtons();
   }
 
   function toggleShuffle() {
@@ -594,6 +649,30 @@
     setStatus(`Repeat ${repeatMode.toUpperCase()}.`);
   }
 
+  function updatePauseButtons() {
+    const media = directCurrent?.media;
+    const canToggle = Boolean(media && currentIndex >= 0 && playlist[currentIndex] && !media.ended);
+    const paused = canToggle && media.paused;
+    const fullButton = document.querySelector(`#${PANEL_ID} [data-gdfp="pause"]`);
+    const miniButton = document.querySelector(`#${PANEL_ID} [data-gdfp="mini-pause"]`);
+
+    if (fullButton) {
+      fullButton.disabled = !canToggle;
+      fullButton.textContent = paused ? 'Resume' : 'Pause';
+      fullButton.style.opacity = canToggle ? '1' : '0.55';
+      fullButton.style.cursor = canToggle ? 'pointer' : 'default';
+    }
+
+    if (miniButton) {
+      miniButton.disabled = !canToggle;
+      miniButton.textContent = paused ? '▶' : 'Ⅱ';
+      miniButton.title = paused ? 'Resume playback' : 'Pause playback';
+      miniButton.setAttribute('aria-label', paused ? 'Resume playback' : 'Pause playback');
+      miniButton.style.opacity = canToggle ? '1' : '0.45';
+      miniButton.style.cursor = canToggle ? 'pointer' : 'default';
+    }
+  }
+
   function updateButtons() {
     const shuffle = document.querySelector(`#${PANEL_ID} [data-gdfp="shuffle"]`);
     const repeat = document.querySelector(`#${PANEL_ID} [data-gdfp="repeat"]`);
@@ -605,21 +684,24 @@
       repeat.textContent = `Repeat: ${repeatMode.toUpperCase()}`;
       repeat.style.background = repeatMode === 'off' ? 'rgba(255,255,255,.10)' : repeatMode === 'all' ? 'rgba(138,180,248,.22)' : 'rgba(196,181,253,.22)';
     }
+    updatePauseButtons();
   }
 
   function renderPlayback() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="playback"]`);
+    updatePauseButtons();
     if (!node) return;
-    if (currentIndex < 0 || !playlist[currentIndex]) {
+    if (!directCurrent || currentIndex < 0 || !playlist[currentIndex]) {
       node.textContent = playlist.length ? `Stopped · ${playlist.length}-track queue` : 'Not playing';
       return;
     }
     const current = playlist[currentIndex];
-    const media = directCurrent?.media;
-    const ratio = media && Number.isFinite(media.duration) && media.duration > 0 ? media.currentTime / media.duration : 0;
+    const media = directCurrent.media;
+    const ratio = Number.isFinite(media.duration) && media.duration > 0 ? media.currentTime / media.duration : 0;
     const percent = Math.round(Math.max(0, Math.min(1, ratio)) * 1000) / 10;
     const preload = directNext ? (directNext.ready ? 'next ready' : 'next loading') : 'no preload';
-    node.textContent = `${autoMode ? '▶' : '■'} ${currentIndex + 1}/${playlist.length} · ${labelOf(current)} · ${percent}% · ${preload}\n${current.name}`;
+    const state = media.paused ? 'Ⅱ' : '▶';
+    node.textContent = `${state} ${currentIndex + 1}/${playlist.length} · ${labelOf(current)} · ${percent}% · ${preload}\n${current.name}`;
   }
 
   function renderQueue() {
@@ -744,6 +826,22 @@
       whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
     });
 
+    const miniPauseButton = document.createElement('button');
+    miniPauseButton.type = 'button';
+    miniPauseButton.dataset.gdfp = 'mini-pause';
+    miniPauseButton.textContent = 'Ⅱ';
+    miniPauseButton.title = 'Pause playback';
+    miniPauseButton.setAttribute('aria-label', 'Pause playback');
+    Object.assign(miniPauseButton.style, {
+      display: 'none', flex: '0 0 auto', width: '28px', height: '26px', padding: '0', borderRadius: '6px',
+      border: '1px solid rgba(255,255,255,.22)', background: 'rgba(255,255,255,.08)', color: 'inherit',
+      cursor: 'pointer', font: '700 13px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+    });
+    miniPauseButton.addEventListener('click', event => {
+      event.stopPropagation();
+      void togglePause();
+    });
+
     const minimizeButton = document.createElement('button');
     minimizeButton.type = 'button';
     minimizeButton.textContent = '−';
@@ -754,7 +852,7 @@
       border: '1px solid rgba(255,255,255,.22)', background: 'rgba(255,255,255,.08)', color: 'inherit',
       cursor: 'pointer', font: '700 16px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
     });
-    header.append(title, minimizeButton);
+    header.append(title, miniPauseButton, minimizeButton);
 
     const body = document.createElement('div');
 
@@ -770,6 +868,7 @@
       button('Shuffle: OFF', toggleShuffle, 'shuffle'),
       button('Repeat: OFF', toggleRepeat, 'repeat'),
       button('Start', () => void startQueue()),
+      button('Pause', () => void togglePause(), 'pause'),
       button('Next', () => void nextNow()),
       button('Stop', stopPlayback)
     );
@@ -832,7 +931,8 @@
     const applyMinimizedState = value => {
       minimized = Boolean(value);
       body.style.display = minimized ? 'none' : '';
-      panel.style.width = minimized ? '220px' : '500px';
+      miniPauseButton.style.display = minimized ? '' : 'none';
+      panel.style.width = minimized ? '250px' : '500px';
       panel.style.maxHeight = minimized ? 'none' : '82vh';
       panel.style.overflow = minimized ? 'hidden' : 'auto';
       panel.style.padding = minimized ? '7px 8px' : '12px';
@@ -841,6 +941,7 @@
       minimizeButton.textContent = minimized ? '▢' : '−';
       minimizeButton.title = minimized ? 'Restore player' : 'Minimize player';
       minimizeButton.setAttribute('aria-label', minimized ? 'Restore player' : 'Minimize player');
+      updatePauseButtons();
       try {
         sessionStorage.setItem(MINIMIZED_KEY, minimized ? '1' : '0');
       } catch {}

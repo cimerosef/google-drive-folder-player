@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player - Probe
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.23
-// @description  Unified direct MP3/WebM playback with next-track preload, Shuffle/Repeat and Drive Preview fallback for other media.
+// @version      0.0.24
+// @description  Full-folder MP3/WebM discovery with direct playback, preload, Shuffle/Repeat and background-safe handoff.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,98 +13,75 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.23';
+  const VERSION = '0.0.24';
   const PANEL_ID = 'gdfp-probe-panel';
+  const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
   const REPEAT_MODES = ['off', 'all', 'one'];
-  const DIRECT_EXTENSIONS = new Set(['mp3', 'webm']);
-  const MEDIA_EXTENSIONS = [
-    'mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma',
-    'webm', 'aiff', 'aif', 'm4b', 'mp4'
-  ];
-  const MEDIA_RE = new RegExp(
-    `([^\\/\\n\\r]{1,320}\\.(?:${MEDIA_EXTENSIONS.join('|')}))(?=\\s|$)`,
-    'i'
-  );
+  const STEP_SETTLE_MS = 360;
+  const BOTTOM_SETTLE_MS = 650;
+  const MAX_STEPS = 240;
 
-  let detectedItems = [];
+  let discoveredItems = [];
   let playlist = [];
   let currentIndex = -1;
   let shuffleMode = false;
-  let playlistShuffled = false;
   let repeatMode = 'off';
   let autoMode = false;
   let advancing = false;
-  let endArmed = false;
-  let monitorTimer = null;
-  let lastRatio = null;
-  let diagnosticHistory = [];
-  let backgroundCloseUnconfirmed = false;
-  let playbackKind = 'none';
-  let transitionRequestedAt = 0;
-
+  let discoveryRunning = false;
+  let stopDiscoveryRequested = false;
   let directCurrent = null;
   let directNext = null;
-
-  let hiddenRangePrevious = new WeakMap();
-  let hiddenRangeActive = null;
-  let hiddenRangeLastMovementAt = 0;
+  let transitionRequestedAt = 0;
+  let logLines = [];
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const log = (...args) => console.log('[GDFP Probe]', ...args);
 
-  function isVisible(element) {
-    if (!(element instanceof Element)) return false;
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    const style = getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0;
+  function stamp() {
+    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
-  function isRendered(element) {
-    if (!(element instanceof Element) || !element.isConnected) return false;
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    return getComputedStyle(element).display !== 'none';
+  function log(text) {
+    logLines.push(`${stamp()}  ${text}`);
+    logLines = logLines.slice(-120);
+    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="log"]`);
+    if (node) node.textContent = logLines.join('\n');
+    console.log('[GDFP]', text);
+  }
+
+  function extensionOf(name) {
+    return String(name || '').toLowerCase().endsWith('.webm') ? 'webm' : 'mp3';
+  }
+
+  function labelOf(item) {
+    return extensionOf(item?.name).toUpperCase();
+  }
+
+  function extractName(element) {
+    if (!(element instanceof Element)) return '';
+    for (const value of [
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('data-tooltip'),
+      element.textContent
+    ]) {
+      if (!value || value.length > 1800) continue;
+      const match = value.trim().match(MEDIA_RE);
+      if (match) return match[1].trim();
+    }
+    return '';
   }
 
   function isInsidePanel(element) {
     return Boolean(element?.closest?.(`#${PANEL_ID}`));
   }
 
-  function extractMediaName(element) {
-    const values = [
-      element.getAttribute?.('aria-label'),
-      element.getAttribute?.('title'),
-      element.getAttribute?.('data-tooltip'),
-      element.textContent
-    ];
-    for (const value of values) {
-      if (!value || value.length > 1800) continue;
-      const match = value.trim().match(MEDIA_RE);
-      if (match) return match[1].trim();
-    }
-    return null;
-  }
-
-  function normalizeName(name) {
-    return String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  }
-
-  function extensionOf(name) {
-    const match = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
-    return match?.[1] || '';
-  }
-
-  function mediaType(item) {
-    return extensionOf(item?.name);
-  }
-
-  function isDirectMedia(item) {
-    return Boolean(item?.id) && DIRECT_EXTENSIONS.has(mediaType(item));
-  }
-
-  function directLabel(item) {
-    return mediaType(item).toUpperCase() || 'MEDIA';
+  function isRendered(element) {
+    if (!(element instanceof Element) || !element.isConnected) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
   }
 
   function findItemRoot(element) {
@@ -155,6 +132,176 @@
     return '';
   }
 
+  function collectRenderedRows() {
+    const candidates = document.querySelectorAll(
+      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
+    );
+    const seenRoots = new Set();
+    const rows = [];
+    for (const element of candidates) {
+      if (!(element instanceof Element) || isInsidePanel(element)) continue;
+      const name = extractName(element);
+      if (!name) continue;
+      const root = findItemRoot(element);
+      if (!root || !isRendered(root) || seenRoots.has(root)) continue;
+      const id = getItemId(root);
+      if (!id) continue;
+      seenRoots.add(root);
+      rows.push({ name, id, type: extensionOf(name), root, top: root.getBoundingClientRect().top });
+    }
+    rows.sort((a, b) => a.top - b.top);
+    return rows;
+  }
+
+  function looksScrollable(element) {
+    if (!(element instanceof Element) || isInsidePanel(element)) return false;
+    const style = getComputedStyle(element);
+    if (!['auto', 'scroll', 'overlay'].includes(style.overflowY)) return false;
+    return element.scrollHeight > element.clientHeight + 80 && element.clientHeight > 180;
+  }
+
+  function scrollableAncestors(element) {
+    const result = [];
+    let node = element?.parentElement;
+    for (let depth = 0; node && depth < 18; depth += 1, node = node.parentElement) {
+      if (looksScrollable(node)) result.push(node);
+    }
+    return result;
+  }
+
+  function findScrollContainer() {
+    const rendered = collectRenderedRows();
+    const row = rendered[Math.floor(rendered.length / 2)]?.root || rendered[0]?.root;
+    if (row) {
+      const ancestors = scrollableAncestors(row);
+      if (ancestors.length) {
+        ancestors.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+        return ancestors[0];
+      }
+    }
+    return [...document.querySelectorAll('div, main, section')]
+      .filter(looksScrollable)
+      .map(element => ({ element, range: element.scrollHeight - element.clientHeight, area: element.clientWidth * element.clientHeight }))
+      .filter(item => item.area > 100000)
+      .sort((a, b) => b.range - a.range || b.area - a.area)[0]?.element || null;
+  }
+
+  function addRowsToMap(map) {
+    const rows = collectRenderedRows();
+    let added = 0;
+    for (const row of rows) {
+      if (map.has(row.id)) continue;
+      map.set(row.id, { id: row.id, name: row.name, type: row.type });
+      added += 1;
+    }
+    return { rows, added };
+  }
+
+  function setStatus(text) {
+    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="status"]`);
+    if (node) node.textContent = text;
+  }
+
+  function renderDiscoverySummary() {
+    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="summary"]`);
+    if (!node) return;
+    const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
+    const webm = discoveredItems.filter(item => item.type === 'webm').length;
+    node.textContent = `${discoveryRunning ? 'DISCOVERING' : 'READY'} | ${discoveredItems.length} full-folder item(s) | ${mp3} MP3 | ${webm} WebM`;
+  }
+
+  async function discoverFullFolder() {
+    if (discoveryRunning || autoMode) {
+      if (autoMode) setStatus('Stop playback before running full-folder discovery.');
+      return false;
+    }
+
+    const scroller = findScrollContainer();
+    if (!scroller) {
+      setStatus('Could not identify the Drive folder scroll container.');
+      log('Discovery aborted: no scroll container found.');
+      return false;
+    }
+
+    discoveryRunning = true;
+    stopDiscoveryRequested = false;
+    renderDiscoverySummary();
+
+    const originalTop = scroller.scrollTop;
+    const originalLeft = scroller.scrollLeft;
+    const found = new Map();
+    scroller.scrollTo({ top: 0, behavior: 'auto' });
+    await sleep(BOTTOM_SETTLE_MS);
+    let sample = addRowsToMap(found);
+    log(`Discovery top pass: rendered=${sample.rows.length}, unique=${found.size}.`);
+
+    let lastTop = scroller.scrollTop;
+    let noMovementRounds = 0;
+    let noNewRounds = 0;
+    let steps = 0;
+
+    while (!stopDiscoveryRequested && steps < MAX_STEPS) {
+      steps += 1;
+      const range = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const stepSize = Math.max(260, Math.floor(scroller.clientHeight * 0.72));
+      const target = Math.min(range, scroller.scrollTop + stepSize);
+      scroller.scrollTo({ top: target, behavior: 'auto' });
+      await sleep(STEP_SETTLE_MS);
+
+      sample = addRowsToMap(found);
+      const currentTop = scroller.scrollTop;
+      const currentRange = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const atBottom = currentRange - currentTop <= 8;
+      noMovementRounds = Math.abs(currentTop - lastTop) < 2 ? noMovementRounds + 1 : 0;
+      noNewRounds = sample.added === 0 ? noNewRounds + 1 : 0;
+      lastTop = currentTop;
+      setStatus(`Discovering full folder… ${found.size} unique item(s), step ${steps}.`);
+      log(`Step ${steps}: top=${Math.round(currentTop)}/${Math.round(currentRange)}, rendered=${sample.rows.length}, +${sample.added}, unique=${found.size}${atBottom ? ' · bottom' : ''}.`);
+
+      if (atBottom) {
+        await sleep(BOTTOM_SETTLE_MS);
+        const finalSample = addRowsToMap(found);
+        const finalRange = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        const stillBottom = finalRange - scroller.scrollTop <= 8;
+        log(`Bottom settle: +${finalSample.added}, unique=${found.size}, stillBottom=${stillBottom}.`);
+        if (stillBottom && finalSample.added === 0) break;
+      }
+
+      if (noMovementRounds >= 4 && noNewRounds >= 4) {
+        log('Discovery stopped after four unchanged rounds.');
+        break;
+      }
+    }
+
+    scroller.scrollTo({ top: Math.min(originalTop, Math.max(0, scroller.scrollHeight - scroller.clientHeight)), behavior: 'auto' });
+    scroller.scrollLeft = originalLeft;
+    await sleep(250);
+
+    const stopped = stopDiscoveryRequested;
+    if (!stopped && found.size) {
+      discoveredItems = [...found.values()];
+      const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
+      const webm = discoveredItems.filter(item => item.type === 'webm').length;
+      setStatus(`Full-folder discovery complete: ${discoveredItems.length} item(s) (${mp3} MP3, ${webm} WebM).`);
+      log(`Discovery completed: ${discoveredItems.length} unique item(s): ${mp3} MP3, ${webm} WebM; steps=${steps}.`);
+    } else if (stopped) {
+      setStatus(`Discovery stopped; previous complete result kept (${discoveredItems.length} item(s)).`);
+      log(`Discovery stopped by user at ${found.size} temporary item(s); previous complete result preserved.`);
+    }
+
+    discoveryRunning = false;
+    stopDiscoveryRequested = false;
+    renderDiscoverySummary();
+    renderQueue();
+    return !stopped && found.size > 0;
+  }
+
+  function stopDiscovery() {
+    if (!discoveryRunning) return;
+    stopDiscoveryRequested = true;
+    log('Stop discovery requested.');
+  }
+
   function authuserIndex() {
     const pathMatch = location.pathname.match(/\/u\/(\d+)(?:\/|$)/);
     if (pathMatch) return pathMatch[1];
@@ -162,327 +309,16 @@
     return query && /^\d+$/.test(query) ? query : '0';
   }
 
-  function directMediaUrl(item) {
+  function directUrl(item) {
     return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(item.id)}` +
       `&export=download&confirm=t&authuser=${encodeURIComponent(authuserIndex())}`;
   }
 
-  function findVisibleProgressSlider() {
-    const sliders = [...document.querySelectorAll(
-      '[role="slider"][aria-valuenow], input[type="range"][aria-valuenow], [aria-valuenow][aria-valuemin][aria-valuemax]'
-    )]
-      .filter(element => !isInsidePanel(element) && isRendered(element))
-      .map(element => {
-        const now = Number(element.getAttribute('aria-valuenow'));
-        const min = Number(element.getAttribute('aria-valuemin'));
-        const max = Number(element.getAttribute('aria-valuemax'));
-        const span = max - min;
-        const rect = element.getBoundingClientRect();
-        return { element, now, min, max, span, width: rect.width };
-      })
-      .filter(item => [item.now, item.min, item.max].every(Number.isFinite) && item.max > item.min);
-
-    if (!sliders.length) return null;
-    sliders.sort((a, b) => {
-      const ap = a.span > 100 ? 1 : 0;
-      const bp = b.span > 100 ? 1 : 0;
-      if (ap !== bp) return bp - ap;
-      if (a.span !== b.span) return b.span - a.span;
-      return b.width - a.width;
-    });
-    return sliders[0].element;
-  }
-
-  function getVisibleProgressState() {
-    const slider = findVisibleProgressSlider();
-    if (!slider) return null;
-    const now = Number(slider.getAttribute('aria-valuenow'));
-    const min = Number(slider.getAttribute('aria-valuemin'));
-    const max = Number(slider.getAttribute('aria-valuemax'));
-    if (![now, min, max].every(Number.isFinite) || max <= min) return null;
-    return {
-      element: slider,
-      now,
-      min,
-      max,
-      ratio: Math.max(0, Math.min(1, (now - min) / (max - min))),
-      source: 'visible slider'
-    };
-  }
-
-  function hiddenRangeCandidates() {
-    return [...document.querySelectorAll('input[type="range"]')]
-      .filter(input => !isInsidePanel(input))
-      .map(input => {
-        const value = Number(input.value);
-        const min = Number(input.min || 0);
-        const max = Number(input.max);
-        if (![value, min, max].every(Number.isFinite) || max <= min) return null;
-        const span = max - min;
-        if (span <= 1000) return null;
-        return {
-          input,
-          now: value,
-          min,
-          max,
-          ratio: Math.max(0, Math.min(1, (value - min) / span)),
-          source: 'hidden native range'
-        };
-      })
-      .filter(Boolean);
-  }
-
-  function sampleHiddenProgressState() {
-    const candidates = hiddenRangeCandidates();
-    let changed = null;
-    for (const state of candidates) {
-      const previous = hiddenRangePrevious.get(state.input);
-      if (previous !== undefined && state.now !== previous) changed = state;
-      hiddenRangePrevious.set(state.input, state.now);
-    }
-    if (changed) {
-      hiddenRangeActive = changed.input;
-      hiddenRangeLastMovementAt = Date.now();
-    }
-    const active = candidates.find(state => state.input === hiddenRangeActive);
-    if (!active) return null;
-    if (Date.now() - hiddenRangeLastMovementAt > 1400) return null;
-    return active;
-  }
-
-  function getProgressState() {
-    return getVisibleProgressState() || sampleHiddenProgressState();
-  }
-
-  function findTopLeftCloseControl() {
-    const buttons = [...document.querySelectorAll('button, [role="button"]')]
-      .filter(element => isVisible(element) && !isInsidePanel(element));
-    const textMatch = /close|fermer|schlie|cerrar|chiudi|fechar|sluiten|关闭|關閉|閉じ|닫기/i;
-    const labelled = buttons.find(element => {
-      const rect = element.getBoundingClientRect();
-      if (rect.top < 0 || rect.top > 110 || rect.left < 0 || rect.left > 130) return false;
-      const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`;
-      return textMatch.test(label);
-    });
-    if (labelled) return labelled;
-    return buttons
-      .map(element => ({ element, rect: element.getBoundingClientRect() }))
-      .filter(({ rect }) =>
-        rect.top >= 0 && rect.top < 105 && rect.left >= 0 && rect.left < 105 &&
-        rect.width <= 90 && rect.height <= 90
-      )
-      .sort((a, b) => (a.rect.top + a.rect.left) - (b.rect.top + b.rect.left))[0]?.element || null;
-  }
-
-  function findPreviewTitle() {
-    const candidates = [...document.querySelectorAll('[aria-label], [title], span, div')];
-    let best = null;
-    const maxLeft = Math.min(window.innerWidth * 0.68, 980);
-    for (const element of candidates) {
-      if (isInsidePanel(element) || !isVisible(element)) continue;
-      if (element.closest('[role="row"], [role="listitem"], [role="gridcell"]')) continue;
-      const rect = element.getBoundingClientRect();
-      if (rect.top < 0 || rect.top > 115 || rect.left < 25 || rect.left > maxLeft) continue;
-      const name = extractMediaName(element);
-      if (!name) continue;
-      const score = (element.children.length === 0 ? 20 : 0) + Math.max(0, 500 - rect.left) / 100;
-      if (!best || score > best.score) best = { element, name, score };
-    }
-    return best;
-  }
-
-  function getPreviewEvidenceFast() {
-    const progress = getProgressState();
-    const title = findPreviewTitle();
-    const close = findTopLeftCloseControl();
-    return {
-      open: Boolean(progress || (title && close)),
-      titleName: title?.name || '',
-      titleElement: title?.element || null,
-      progress,
-      close
-    };
-  }
-
-  function getPreviewEvidence() {
-    return getPreviewEvidenceFast();
-  }
-
-  function collectFolderRows() {
-    const previewOpen = getPreviewEvidenceFast().open;
-    const candidates = document.querySelectorAll(
-      '[role="row"], [role="gridcell"], [role="rowheader"], [role="listitem"], a, span, [aria-label], [title], [data-tooltip]'
-    );
-    const seenRoots = new Set();
-    const seenKeys = new Set();
-    const results = [];
-
-    for (const element of candidates) {
-      if (isInsidePanel(element)) continue;
-      const name = extractMediaName(element);
-      if (!name) continue;
-      const rect = element.getBoundingClientRect();
-      if (previewOpen && rect.top >= 0 && rect.top < 130 && !element.closest('[role="row"], [role="listitem"]')) continue;
-      const root = findItemRoot(element);
-      if (!root || !isVisible(root) || isInsidePanel(root)) continue;
-      const rootRect = root.getBoundingClientRect();
-      const id = getItemId(root);
-      const key = `${id || normalizeName(name)}::${Math.round(rootRect.top)}::${Math.round(rootRect.left)}`;
-      if (seenRoots.has(root) || seenKeys.has(key)) continue;
-      seenRoots.add(root);
-      seenKeys.add(key);
-      results.push({ name, id, root });
-    }
-    return results;
-  }
-
-  function scanCurrentView() {
-    const started = performance.now();
-    const results = collectFolderRows();
-    if (results.length) detectedItems = results;
-    renderResults();
-    const directCount = results.filter(isDirectMedia).length;
-    const mp3Count = results.filter(item => isDirectMedia(item) && mediaType(item) === 'mp3').length;
-    const webmCount = results.filter(item => isDirectMedia(item) && mediaType(item) === 'webm').length;
-    setStatus(
-      results.length
-        ? `Scan finished: ${results.length} visible media row(s); ${directCount} direct candidate(s) (${mp3Count} MP3, ${webmCount} WebM).`
-        : 'No new media rows found. The previous successful scan, if any, is kept.'
-    );
-    addDiagnostic(`Scan: ${results.length} live row(s); ${directCount} direct MP3/WebM; cache ${detectedItems.length}; ${Math.round(performance.now() - started)} ms.`);
-    return results;
-  }
-
-  function clickElement(element) {
-    if (!element) return;
-    try {
-      element.click();
-    } catch {
-      element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window }));
-    }
-  }
-
-  function dispatchDoubleClick(element) {
-    const common = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: 1 };
-    element.dispatchEvent(new MouseEvent('mousedown', { ...common, detail: 1 }));
-    element.dispatchEvent(new MouseEvent('mouseup', { ...common, detail: 1 }));
-    element.dispatchEvent(new MouseEvent('click', { ...common, detail: 1 }));
-    element.dispatchEvent(new MouseEvent('mousedown', { ...common, detail: 2 }));
-    element.dispatchEvent(new MouseEvent('mouseup', { ...common, detail: 2 }));
-    element.dispatchEvent(new MouseEvent('click', { ...common, detail: 2 }));
-    element.dispatchEvent(new MouseEvent('dblclick', { ...common, detail: 2 }));
-  }
-
-  async function closePreview(allowHiddenFallback = false) {
-    const before = getPreviewEvidence();
-    if (!before.open) return true;
-    const close = before.close || findTopLeftCloseControl();
-    if (!close) {
-      setStatus('Transition blocked: preview is open but its close control was not found.');
-      addDiagnostic(`Close failed: no close control. Preview title: ${before.titleName || '(none)'}.`);
-      return false;
-    }
-    const started = performance.now();
-    addDiagnostic(`Closing preview: ${before.titleName || '(title not detected)'}.`);
-    clickElement(close);
-    for (let i = 0; i < 40; i += 1) {
-      await sleep(50);
-      if (!getPreviewEvidence().open) {
-        await sleep(50);
-        addDiagnostic(`Preview closed in ${Math.round(performance.now() - started)} ms.`);
-        return true;
-      }
-    }
-    if (allowHiddenFallback && document.hidden) {
-      backgroundCloseUnconfirmed = true;
-      setStatus('Background transition: preview close not yet confirmed; continuing with guarded next-track check.');
-      addDiagnostic('Close confirmation timed out while hidden; continuing only with positive target-title confirmation.');
-      return true;
-    }
-    setStatus('Transition blocked: preview close was not confirmed within the retry window.');
-    addDiagnostic('Close confirmation timed out.');
-    return false;
-  }
-
-  function matchesTarget(item, target) {
-    if (!item || !target) return false;
-    if (target.id && item.id) return item.id === target.id;
-    return normalizeName(item.name) === normalizeName(target.name);
-  }
-
-  function rowNeedsScroll(root) {
-    const rect = root.getBoundingClientRect();
-    return rect.top < 120 || rect.bottom > window.innerHeight - 24;
-  }
-
-  async function resolveFreshItem(target, patient = false) {
-    const maxAttempts = patient ? 18 : 8;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const rows = collectFolderRows();
-      let item = rows.find(row => matchesTarget(row, target));
-      if (item?.root?.isConnected && isVisible(item.root)) {
-        if (!rowNeedsScroll(item.root)) {
-          addDiagnostic(`Resolved row immediately on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
-          return item;
-        }
-        item.root.scrollIntoView({ block: 'center', inline: 'nearest' });
-        await sleep(patient ? 300 : 90);
-        item = collectFolderRows().find(row => matchesTarget(row, target));
-        if (item?.root?.isConnected && isVisible(item.root)) {
-          addDiagnostic(`Resolved row after scroll on attempt ${attempt}; stable id: ${target.id ? 'yes' : 'no'}.`);
-          return item;
-        }
-      }
-      await sleep(patient ? (attempt < 6 ? 180 : 350) : (attempt < 4 ? 60 : 120));
-    }
-    addDiagnostic(`Row resolution failed: ${target.name}`);
-    return null;
-  }
-
-  async function waitForPreview(target, timeoutMs = 5200, requireTargetTitle = false) {
-    const started = Date.now();
-    let lastTitle = '';
-    while (Date.now() - started < timeoutMs) {
-      const evidence = getPreviewEvidence();
-      if (evidence.titleName) lastTitle = evidence.titleName;
-      const titleMatches = Boolean(evidence.titleName) && normalizeName(evidence.titleName) === normalizeName(target.name);
-      if (evidence.open && (requireTargetTitle ? titleMatches : (!evidence.titleName || titleMatches))) return { ok: true, evidence };
-      await sleep(requireTargetTitle ? 180 : 60);
-    }
-    return { ok: false, lastTitle };
-  }
-
-  async function tryOpenTarget(target, index, reason, attempt, requireTargetTitle = false) {
-    const live = await resolveFreshItem(target, requireTargetTitle);
-    if (!live?.root?.isConnected) {
-      setStatus(`Transition failed: no fresh Drive row for ${target.name}`);
-      return false;
-    }
-    setStatus(`Opening ${index + 1}/${playlist.length} (${reason}, attempt ${attempt}${requireTargetTitle ? ', guarded background' : ''}): ${target.name}`);
-    addDiagnostic(`Open Preview attempt ${attempt}${requireTargetTitle ? ' [guarded background]' : ''}: ${target.name}`);
-    dispatchDoubleClick(live.root);
-    const result = await waitForPreview(target, requireTargetTitle ? 15000 : 5200, requireTargetTitle);
-    if (result.ok) {
-      addDiagnostic(`Preview confirmed: ${result.evidence.titleName || `(progress via ${result.evidence.progress?.source || 'unknown'})`}.`);
-      return true;
-    }
-    addDiagnostic(`Open Preview attempt ${attempt} timed out. Last title: ${result.lastTitle || '(none)'}.`);
-    return false;
-  }
-
-  function resetProgressTracking() {
-    endArmed = false;
-    lastRatio = null;
-    hiddenRangePrevious = new WeakMap();
-    hiddenRangeActive = null;
-    hiddenRangeLastMovementAt = 0;
-  }
-
-  function createDirectElement(item) {
-    const media = mediaType(item) === 'webm' ? document.createElement('video') : new Audio();
+  function createMedia(item) {
+    const media = item.type === 'webm' ? document.createElement('video') : new Audio();
     media.preload = 'auto';
     media.controls = false;
-    if (mediaType(item) === 'webm') {
+    if (item.type === 'webm') {
       media.playsInline = true;
       media.style.display = 'none';
     }
@@ -499,79 +335,56 @@
     } catch {}
   }
 
-  function clearDirectNext() {
+  function clearNext() {
     if (!directNext) return;
     disposeMedia(directNext.media);
     directNext = null;
   }
 
-  function clearDirectCurrent() {
+  function clearCurrent() {
     if (!directCurrent) return;
     disposeMedia(directCurrent.media);
     directCurrent = null;
   }
 
-  function clearAllDirectMedia() {
-    clearDirectCurrent();
-    clearDirectNext();
+  function clearMedia() {
+    clearCurrent();
+    clearNext();
   }
 
-  function createDirectSlot(item, index, role) {
-    const media = createDirectElement(item);
+  function createSlot(item, index, role) {
+    const media = createMedia(item);
     const slot = { media, item: { ...item }, index, role, ready: false, failed: false };
-    const label = directLabel(item);
 
-    media.addEventListener('loadedmetadata', () => {
-      addDiagnostic(`${slot.role} direct ${label} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`);
-    });
+    media.addEventListener('loadedmetadata', () => log(`${slot.role} ${labelOf(item)} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`));
     media.addEventListener('canplay', () => {
       slot.ready = true;
-      if (slot === directNext) renderPlaybackState(`direct ${label} · next preloaded`);
+      renderPlayback();
     });
     media.addEventListener('error', () => {
       slot.failed = true;
-      addDiagnostic(`${slot.role} direct ${label} error for ${item.name}; code=${media.error?.code || 'unknown'}.`);
+      log(`${slot.role} ${labelOf(item)} error: ${item.name}; code=${media.error?.code || 'unknown'}.`);
     });
-    media.addEventListener('waiting', () => addDiagnostic(`${slot.role} direct ${label} waiting: ${item.name}.`));
+    media.addEventListener('waiting', () => log(`${slot.role} ${labelOf(item)} waiting: ${item.name}.`));
     media.addEventListener('playing', () => {
       if (slot === directCurrent && transitionRequestedAt) {
-        addDiagnostic(`Direct audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
+        log(`Audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
         transitionRequestedAt = 0;
       }
     });
     media.addEventListener('ended', () => {
-      if (directCurrent !== slot || currentIndex !== index || playbackKind !== 'direct-media') return;
-      addDiagnostic(`Direct ${label} ended naturally: track ${index + 1}/${playlist.length}.`);
-      if (autoMode && !advancing) void handleTrackEnd();
+      if (directCurrent !== slot || currentIndex !== index) return;
+      log(`Natural end: ${index + 1}/${playlist.length} [${labelOf(item)}].`);
+      if (autoMode && !advancing) void handleEnd();
     });
 
-    media.src = directMediaUrl(item);
+    media.src = directUrl(item);
     media.load();
     return slot;
   }
 
-  function nextIndexForPreload() {
-    if (!autoMode || !playlist.length || currentIndex < 0 || repeatMode === 'one') return -1;
-    const next = currentIndex + 1;
-    if (next < playlist.length) return next;
-    return repeatMode === 'all' ? 0 : -1;
-  }
-
-  function prepareDirectNext() {
-    const index = nextIndexForPreload();
-    if (index < 0 || !isDirectMedia(playlist[index])) {
-      clearDirectNext();
-      return;
-    }
-    const item = playlist[index];
-    if (directNext && directNext.index === index && directNext.item.id === item.id && !directNext.failed) return;
-    clearDirectNext();
-    directNext = createDirectSlot(item, index, 'next');
-    addDiagnostic(`Preloading next direct ${directLabel(item)} ${index + 1}/${playlist.length}: ${item.name}`);
-  }
-
-  async function waitForDirectReady(slot, timeoutMs = 10000) {
-    if (!slot?.media || slot.failed) return false;
+  async function waitReady(slot, timeoutMs = 10000) {
+    if (!slot || slot.failed) return false;
     if (slot.media.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return true;
     return await new Promise(resolve => {
       let done = false;
@@ -591,460 +404,255 @@
     });
   }
 
-  async function openDirectMediaIndex(index, reason) {
-    const target = playlist[index];
-    const previousIndex = currentIndex;
-    const previousKind = playbackKind;
-    const oldCurrent = directCurrent;
+  function nextIndexForPreload() {
+    if (!autoMode || !playlist.length || currentIndex < 0 || repeatMode === 'one') return -1;
+    const next = currentIndex + 1;
+    if (next < playlist.length) return next;
+    return repeatMode === 'all' ? 0 : -1;
+  }
 
-    if (getPreviewEvidence().open) {
-      const closed = await closePreview(document.hidden);
-      if (!closed) return false;
+  function prepareNext() {
+    const index = nextIndexForPreload();
+    if (index < 0) {
+      clearNext();
+      renderPlayback();
+      return;
     }
+    const item = playlist[index];
+    if (directNext && directNext.index === index && directNext.item.id === item.id && !directNext.failed) return;
+    clearNext();
+    directNext = createSlot(item, index, 'next');
+    log(`Preloading ${index + 1}/${playlist.length} [${labelOf(item)}]: ${item.name}`);
+  }
 
+  async function playIndex(index, reason = 'manual') {
+    if (advancing || !playlist[index]) return false;
+    advancing = true;
+    const target = playlist[index];
+    const oldCurrent = directCurrent;
     let slot;
     let promoted = false;
-    if (directNext && directNext.index === index && directNext.item.id === target.id && !directNext.failed) {
-      slot = directNext;
-      directNext = null;
-      slot.role = 'current';
-      promoted = true;
-      addDiagnostic(`Promoting preloaded direct ${directLabel(target)} ${index + 1}/${playlist.length}.`);
-    } else {
-      slot = createDirectSlot(target, index, 'current');
-      addDiagnostic(`Direct ${directLabel(target)} created for ${index + 1}/${playlist.length}: ${target.name}`);
-    }
 
-    directCurrent = slot;
-    playbackKind = 'direct-media';
-    const ready = await waitForDirectReady(slot, promoted ? 6000 : 10000);
-    if (!ready || slot.failed) {
-      if (directCurrent === slot) directCurrent = oldCurrent;
-      disposeMedia(slot.media);
-      playbackKind = oldCurrent ? 'direct-media' : previousKind;
-      addDiagnostic(`Direct ${directLabel(target)} not ready; will try Drive Preview fallback: ${target.name}`);
-      return false;
-    }
-
-    if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
-    transitionRequestedAt = performance.now();
     try {
+      if (directNext && directNext.index === index && directNext.item.id === target.id && !directNext.failed) {
+        slot = directNext;
+        directNext = null;
+        slot.role = 'current';
+        promoted = true;
+        log(`Promoting preloaded ${index + 1}/${playlist.length}.`);
+      } else {
+        slot = createSlot(target, index, 'current');
+        log(`Created current media ${index + 1}/${playlist.length} [${labelOf(target)}].`);
+      }
+
+      directCurrent = slot;
+      const ready = await waitReady(slot, promoted ? 6000 : 10000);
+      if (!ready || slot.failed) {
+        if (directCurrent === slot) directCurrent = oldCurrent;
+        disposeMedia(slot.media);
+        setStatus(`Direct media failed to become ready: ${target.name}`);
+        return false;
+      }
+
+      if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
+      transitionRequestedAt = performance.now();
       await slot.media.play();
+      if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
+      currentIndex = index;
+      setStatus(`Playing ${index + 1}/${playlist.length} [${labelOf(target)}]${promoted ? ' from preload' : ''}: ${target.name}`);
+      log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promoted ? ' from preload' : ''}.`);
+      prepareNext();
+      renderPlayback();
+      renderQueue();
+      return true;
     } catch (error) {
       transitionRequestedAt = 0;
-      if (directCurrent === slot) directCurrent = oldCurrent;
-      disposeMedia(slot.media);
-      playbackKind = oldCurrent ? 'direct-media' : previousKind;
-      currentIndex = previousIndex;
-      if (oldCurrent?.media && !oldCurrent.media.ended) {
-        try { await oldCurrent.media.play(); } catch {}
-      }
-      addDiagnostic(`Direct ${directLabel(target)} play rejected (${error?.name || 'Error'}); trying Preview fallback.`);
+      if (slot && directCurrent === slot) directCurrent = oldCurrent;
+      if (slot) disposeMedia(slot.media);
+      setStatus(`play() failed: ${error?.name || 'Error'}`);
+      log(`play() failed for ${target.name}: ${error?.name || 'Error'}.`);
       return false;
-    }
-
-    if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
-    currentIndex = index;
-    setStatus(`Playing ${index + 1}/${playlist.length} via direct ${directLabel(target)}: ${target.name}`);
-    renderPlaybackState(`${reason} · direct ${directLabel(target)}${promoted ? ' · preloaded' : ''}`);
-    renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Direct ${directLabel(target)} playing ${index + 1}/${playlist.length}${promoted ? ' from preload' : ''}: ${target.name}`);
-    prepareDirectNext();
-    startMonitor();
-    return true;
-  }
-
-  async function openPreviewIndex(index, reason) {
-    const target = playlist[index];
-    const previousIndex = currentIndex;
-    clearAllDirectMedia();
-    playbackKind = 'preview';
-    const hiddenTransition = document.hidden;
-    if (getPreviewEvidence().open && !(await closePreview(hiddenTransition))) return false;
-
-    let requireTargetTitle = backgroundCloseUnconfirmed;
-    let opened = await tryOpenTarget(target, index, reason, 1, requireTargetTitle);
-    if (!opened) {
-      const evidence = getPreviewEvidence();
-      const titleMatches = Boolean(evidence.titleName) && normalizeName(evidence.titleName) === normalizeName(target.name);
-      if (evidence.open && (requireTargetTitle ? titleMatches : (!evidence.titleName || titleMatches))) {
-        opened = true;
-        addDiagnostic(requireTargetTitle ? 'Late target-title confirmation; accepting guarded Preview transition.' : 'Late Preview detected after timeout; accepting transition.');
-      }
-    }
-
-    if (!opened) {
-      if (getPreviewEvidence().open) {
-        await closePreview(document.hidden || requireTargetTitle);
-        requireTargetTitle = requireTargetTitle || backgroundCloseUnconfirmed;
-      }
-      await sleep(requireTargetTitle ? 500 : 120);
-      opened = await tryOpenTarget(target, index, reason, 2, requireTargetTitle);
-    }
-
-    if (!opened) {
-      currentIndex = previousIndex;
-      playbackKind = 'none';
-      setStatus(`Transition failed: Drive Preview did not open for ${target.name}`);
-      renderPlaybackState('Preview transition failed; index preserved');
-      renderQueuePreview(playlist, currentIndex);
-      addDiagnostic(`Preview transition failed; index remains ${previousIndex + 1}/${playlist.length}.`);
-      return false;
-    }
-
-    currentIndex = index;
-    setStatus(`Playing ${index + 1}/${playlist.length} via Drive Preview fallback: ${target.name}`);
-    renderPlaybackState(`${reason} · Drive Preview fallback`);
-    renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Drive Preview fallback playing ${index + 1}/${playlist.length}: ${target.name}`);
-    prepareDirectNext();
-    startMonitor();
-    return true;
-  }
-
-  function cloneDetectedPlaylist() {
-    return detectedItems.map(item => ({ name: item.name, id: item.id || '' }));
-  }
-
-  function shuffleInPlace(items) {
-    for (let i = items.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [items[i], items[j]] = [items[j], items[i]];
-    }
-    return items;
-  }
-
-  function buildPlaylist() {
-    const built = cloneDetectedPlaylist();
-    if (shuffleMode) shuffleInPlace(built);
-    return built;
-  }
-
-  function toggleShuffle() {
-    shuffleMode = !shuffleMode;
-    updateShuffleButton();
-    renderPlaybackState(autoMode ? 'Shuffle setting changed; applies on next Start' : 'Ready');
-    addDiagnostic(`Shuffle mode ${shuffleMode ? 'ON' : 'OFF'}${autoMode ? '; current queue kept.' : '.'}`);
-    if (!autoMode) {
-      const previewQueue = buildPlaylist();
-      renderQueuePreview(previewQueue, -1);
-      setStatus(shuffleMode ? 'Shuffle is ON. Start playback to use a newly shuffled queue.' : 'Shuffle is OFF. Start playback to use folder order.');
-    } else {
-      setStatus(`Shuffle is now ${shuffleMode ? 'ON' : 'OFF'}; current queue is unchanged until restart.`);
-    }
-  }
-
-  function toggleRepeat() {
-    const index = REPEAT_MODES.indexOf(repeatMode);
-    repeatMode = REPEAT_MODES[(index + 1) % REPEAT_MODES.length];
-    updateRepeatButton();
-    renderPlaybackState('Repeat setting changed');
-    renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Repeat mode ${repeatMode.toUpperCase()}.`);
-    prepareDirectNext();
-    if (repeatMode === 'off') setStatus('Repeat is OFF. Playback stops at queue end.');
-    else if (repeatMode === 'all') setStatus('Repeat ALL is ON. Current queue wraps to track 1.');
-    else setStatus('Repeat ONE is ON. Natural end repeats the current track; Next now still advances.');
-  }
-
-  async function openPlaylistIndex(index, reason = 'manual') {
-    if (!playlist.length || advancing || index < 0 || index >= playlist.length) return false;
-    advancing = true;
-    resetProgressTracking();
-    backgroundCloseUnconfirmed = false;
-    const started = performance.now();
-    try {
-      const target = playlist[index];
-      let opened = false;
-      if (isDirectMedia(target)) {
-        opened = await openDirectMediaIndex(index, reason);
-        if (!opened) {
-          addDiagnostic(`Direct ${directLabel(target)} route failed; trying Drive Preview fallback for ${target.name}.`);
-          opened = await openPreviewIndex(index, `${reason} · direct fallback`);
-        }
-      } else {
-        opened = await openPreviewIndex(index, reason);
-      }
-      if (opened) addDiagnostic(`Unified transition accepted -> ${index + 1}/${playlist.length} in ${Math.round(performance.now() - started)} ms via ${playbackKind}.`);
-      return opened;
     } finally {
       advancing = false;
     }
   }
 
-  async function startContinuousTest() {
-    if (!detectedItems.length) scanCurrentView();
-    if (!detectedItems.length) {
-      setStatus('No media rows cached. Close Preview, scan the folder, then retry.');
-      return;
+  function shuffleCopy(items) {
+    const copy = items.map(item => ({ ...item }));
+    for (let i = copy.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
     }
-    autoMode = true;
-    playlistShuffled = shuffleMode;
-    playlist = buildPlaylist();
-    currentIndex = -1;
-    playbackKind = 'none';
-    diagnosticHistory = [];
-    transitionRequestedAt = 0;
-    clearAllDirectMedia();
-    renderQueuePreview(playlist, currentIndex);
-    addDiagnostic(`Playlist captured: ${playlist.length}; ${playlist.filter(item => item.id).length} stable ids; ${playlist.filter(isDirectMedia).length} direct MP3/WebM; mode=${playlistShuffled ? 'shuffle' : 'ordered'}; repeat=${repeatMode}.`);
-    if (playlistShuffled) addDiagnostic(`Shuffle head: ${playlist.slice(0, 5).map(item => item.name).join(' | ')}`);
-    await openPlaylistIndex(0, playlistShuffled ? 'shuffle start' : 'start');
+    return copy;
   }
 
-  function stopContinuousTest() {
-    autoMode = false;
-    resetProgressTracking();
-    transitionRequestedAt = 0;
-    clearAllDirectMedia();
-    playbackKind = getPreviewEvidence().open ? 'preview' : 'none';
-    if (monitorTimer) {
-      clearInterval(monitorTimer);
-      monitorTimer = null;
+  function buildPlaylist() {
+    return shuffleMode ? shuffleCopy(discoveredItems) : discoveredItems.map(item => ({ ...item }));
+  }
+
+  async function startQueue() {
+    if (discoveryRunning) return;
+    if (!discoveredItems.length) {
+      const ok = await discoverFullFolder();
+      if (!ok) return;
     }
-    setStatus(playbackKind === 'preview' ? 'Continuous stopped. Existing Drive Preview playback was left untouched.' : 'Continuous stopped. Direct media was paused and released.');
-    renderPlaybackState('Stopped');
-    renderQueuePreview(playlist, currentIndex);
-    addDiagnostic('Continuous playback stopped.');
+    clearMedia();
+    playlist = buildPlaylist();
+    currentIndex = -1;
+    autoMode = true;
+    log(`Queue built: ${playlist.length} track(s), mode=${shuffleMode ? 'SHUFFLE' : 'ORDERED'}, repeat=${repeatMode.toUpperCase()}.`);
+    renderQueue();
+    await playIndex(0, 'start');
   }
 
   async function nextNow() {
     if (!playlist.length) {
-      playlistShuffled = shuffleMode;
-      playlist = buildPlaylist();
-      renderQueuePreview(playlist, -1);
-    }
-    if (!playlist.length) {
-      setStatus('No cached media items. Scan the folder first.');
+      setStatus('Start a queue first.');
       return;
     }
     autoMode = true;
-    let nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
-    if (nextIndex >= playlist.length) {
-      if (repeatMode === 'all') {
-        nextIndex = 0;
-        addDiagnostic('Manual Next wrapped to track 1 because Repeat ALL is active.');
-      } else {
-        stopContinuousTest();
-        setStatus('Reached the end of the cached test playlist.');
+    let next = currentIndex + 1;
+    if (next >= playlist.length) {
+      if (repeatMode === 'all') next = 0;
+      else {
+        setStatus('Queue end reached.');
         return;
       }
     }
-    await openPlaylistIndex(nextIndex, 'Next now');
+    await playIndex(next, 'Next now');
   }
 
-  async function repeatDirectCurrent() {
-    if (!directCurrent?.media) return false;
+  function seekLast5s() {
+    const media = directCurrent?.media;
+    if (!media || !Number.isFinite(media.duration) || media.duration <= 6) {
+      setStatus('Current media duration is not ready.');
+      return;
+    }
+    media.currentTime = media.duration - 5;
+    log(`Seeked current track to last ~5 seconds (${media.currentTime.toFixed(1)}/${media.duration.toFixed(1)}).`);
+  }
+
+  async function repeatCurrent() {
+    const media = directCurrent?.media;
+    if (!media) return false;
     try {
-      directCurrent.media.currentTime = 0;
+      media.currentTime = 0;
       transitionRequestedAt = performance.now();
-      await directCurrent.media.play();
-      setStatus(`Repeat ONE: replaying ${currentIndex + 1}/${playlist.length} via direct ${directLabel(playlist[currentIndex])}.`);
-      renderPlaybackState(`Repeat ONE · direct ${directLabel(playlist[currentIndex])}`);
-      addDiagnostic(`Repeat ONE restarted direct ${directLabel(playlist[currentIndex])} track ${currentIndex + 1}.`);
+      await media.play();
+      log(`Repeat ONE restarted track ${currentIndex + 1}/${playlist.length}.`);
       return true;
-    } catch (error) {
-      transitionRequestedAt = 0;
-      addDiagnostic(`Direct Repeat ONE restart failed: ${error?.name || 'Error'}.`);
+    } catch {
       return false;
     }
   }
 
-  async function handleTrackEnd() {
+  async function handleEnd() {
     if (!autoMode || advancing || currentIndex < 0) return;
-    endArmed = false;
     if (repeatMode === 'one') {
-      if (playbackKind === 'direct-media' && await repeatDirectCurrent()) return;
-      setStatus(`End detected. Repeating track ${currentIndex + 1}/${playlist.length}…`);
-      addDiagnostic('End detected; Repeat ONE reopening current Preview/fallback track.');
-      await openPlaylistIndex(currentIndex, 'repeat one');
+      await repeatCurrent();
       return;
     }
-    let nextIndex = currentIndex + 1;
-    if (nextIndex >= playlist.length) {
-      if (repeatMode === 'all') {
-        nextIndex = 0;
-        setStatus(`End detected. Repeat ALL restarting the ${playlistShuffled ? 'shuffled' : 'ordered'} queue…`);
-        addDiagnostic('Queue end reached; Repeat ALL wrapping to track 1 without rebuilding queue.');
-        await openPlaylistIndex(nextIndex, 'repeat all');
+    let next = currentIndex + 1;
+    if (next >= playlist.length) {
+      if (repeatMode === 'all') next = 0;
+      else {
+        autoMode = false;
+        clearNext();
+        setStatus(`Queue finished (${playlist.length} track(s)).`);
+        renderPlayback();
         return;
       }
-      autoMode = false;
-      clearDirectNext();
-      setStatus(`${playlistShuffled ? 'Shuffled' : 'Cached'} playlist finished (${playlist.length} track(s)).`);
-      renderPlaybackState('Playlist finished');
-      renderQueuePreview(playlist, currentIndex);
-      addDiagnostic('Playlist finished; Repeat OFF.');
-      return;
     }
-    setStatus(`End detected. Advancing to ${nextIndex + 1}/${playlist.length}…`);
-    addDiagnostic(`Natural end -> advancing within ${playlistShuffled ? 'shuffle' : 'ordered'} queue.`);
-    await openPlaylistIndex(nextIndex, 'automatic next');
+    await playIndex(next, 'natural next');
   }
 
-  function monitorTick() {
-    if (!autoMode || advancing || currentIndex < 0) return;
-    if (playbackKind === 'direct-media') {
-      const media = directCurrent?.media;
-      if (!media) return;
-      const ratio = Number.isFinite(media.duration) && media.duration > 0
-        ? Math.max(0, Math.min(1, media.currentTime / media.duration))
-        : 0;
-      const percent = Math.round(ratio * 1000) / 10;
-      const nextReady = directNext?.ready ? ' · next preloaded' : directNext ? ' · next loading' : '';
-      renderPlaybackState(`${percent}% · direct ${directLabel(playlist[currentIndex])}${nextReady}`);
-      return;
-    }
-
-    if (playbackKind !== 'preview') return;
-    const progress = getProgressState();
-    if (!progress) {
-      renderPlaybackState('Drive Preview fallback · progress unavailable/hidden');
-      return;
-    }
-    const ratio = progress.ratio;
-    if (!endArmed && ratio < 0.95) endArmed = true;
-    const percent = Math.round(ratio * 1000) / 10;
-    renderPlaybackState(`${percent}% · Drive Preview · ${progress.source}${endArmed ? ' · armed' : ' · waiting reset'}`);
-    if (endArmed && ratio >= 0.995 && (lastRatio === null || lastRatio < 0.995)) {
-      log(`Preview track end inferred from ${progress.source}.`, progress);
-      void handleTrackEnd();
-    }
-    lastRatio = ratio;
+  function stopPlayback() {
+    autoMode = false;
+    transitionRequestedAt = 0;
+    clearMedia();
+    setStatus('Playback stopped.');
+    renderPlayback();
   }
 
-  function startMonitor() {
-    if (monitorTimer) return;
-    monitorTimer = setInterval(monitorTick, 250);
+  function toggleShuffle() {
+    shuffleMode = !shuffleMode;
+    updateButtons();
+    setStatus(`Shuffle ${shuffleMode ? 'ON' : 'OFF'}; applies when the queue is rebuilt.`);
   }
 
-  function seekCurrentToLast5s() {
-    if (playbackKind !== 'direct-media' || !directCurrent?.media) {
-      setStatus('Seek test only applies while a direct MP3/WebM track is playing.');
-      return;
-    }
-    const media = directCurrent.media;
-    if (!Number.isFinite(media.duration) || media.duration <= 6) {
-      setStatus('Current direct media duration is not ready yet.');
-      return;
-    }
-    media.currentTime = Math.max(0, media.duration - 5);
-    addDiagnostic(`Seeked current direct ${directLabel(playlist[currentIndex])} to last ~5 seconds (${media.currentTime.toFixed(1)}/${media.duration.toFixed(1)}).`);
+  function toggleRepeat() {
+    repeatMode = REPEAT_MODES[(REPEAT_MODES.indexOf(repeatMode) + 1) % REPEAT_MODES.length];
+    updateButtons();
+    prepareNext();
+    setStatus(`Repeat ${repeatMode.toUpperCase()}.`);
   }
 
-  function probeTransition() {
-    const evidence = getPreviewEvidence();
-    const close = evidence.close || findTopLeftCloseControl();
-    const title = evidence.titleName || '(none)';
-    const progress = evidence.progress ? `${Math.round(evidence.progress.ratio * 1000) / 10}% [${evidence.progress.min}..${evidence.progress.max}] via ${evidence.progress.source}` : '(none)';
+  function updateButtons() {
+    const shuffle = document.querySelector(`#${PANEL_ID} [data-gdfp="shuffle"]`);
+    const repeat = document.querySelector(`#${PANEL_ID} [data-gdfp="repeat"]`);
+    if (shuffle) {
+      shuffle.textContent = `Shuffle: ${shuffleMode ? 'ON' : 'OFF'}`;
+      shuffle.style.background = shuffleMode ? 'rgba(129,201,149,.22)' : 'rgba(255,255,255,.10)';
+    }
+    if (repeat) {
+      repeat.textContent = `Repeat: ${repeatMode.toUpperCase()}`;
+      repeat.style.background = repeatMode === 'off' ? 'rgba(255,255,255,.10)' : repeatMode === 'all' ? 'rgba(138,180,248,.22)' : 'rgba(196,181,253,.22)';
+    }
+  }
+
+  function renderPlayback() {
+    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="playback"]`);
+    if (!node) return;
+    if (currentIndex < 0 || !playlist[currentIndex]) {
+      node.textContent = `Playback: OFF | Queue: ${playlist.length || 0}`;
+      return;
+    }
+    const current = playlist[currentIndex];
     const media = directCurrent?.media;
-    const direct = media ? `${mediaType(directCurrent.item).toUpperCase()} ${media.currentTime.toFixed(1)}/${Number.isFinite(media.duration) ? media.duration.toFixed(1) : 'n/a'}s` : '(none)';
-    const closeDesc = close ? `${close.tagName.toLowerCase()} label="${close.getAttribute('aria-label') || close.getAttribute('title') || '(none)'}"` : '(none)';
-    addDiagnostic(`Probe -> engine=${playbackKind}; direct=${direct}; next=${directNext ? `${directLabel(directNext.item)}:${directNext.ready ? 'ready' : 'loading'}` : '(none)'}; previewOpen=${evidence.open}; title=${title}; progress=${progress}; close=${closeDesc}`);
+    const ratio = media && Number.isFinite(media.duration) && media.duration > 0 ? media.currentTime / media.duration : 0;
+    const percent = Math.round(Math.max(0, Math.min(1, ratio)) * 1000) / 10;
+    const preload = directNext ? (directNext.ready ? 'next preloaded' : 'next loading') : 'no next preload';
+    node.textContent = `${autoMode ? 'ON' : 'PAUSED'} | ${currentIndex + 1}/${playlist.length} | ${labelOf(current)} | ${percent}% | ${preload}\n${current.name}`;
   }
 
-  function setStatus(text) {
-    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="status"]`);
-    if (node) node.textContent = text;
-  }
-
-  function addDiagnostic(text) {
-    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    diagnosticHistory.push(`${stamp}  ${text}`);
-    diagnosticHistory = diagnosticHistory.slice(-12);
-    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="diagnostic"]`);
-    if (node) node.textContent = diagnosticHistory.join('\n');
-    log(text);
-  }
-
-  function updateShuffleButton() {
-    const button = document.querySelector(`#${PANEL_ID} [data-gdfp="shuffle-toggle"]`);
-    if (!button) return;
-    button.textContent = `Shuffle: ${shuffleMode ? 'ON' : 'OFF'}`;
-    button.setAttribute('aria-pressed', String(shuffleMode));
-    button.style.background = shuffleMode ? 'rgba(129,201,149,.22)' : 'rgba(255,255,255,.11)';
-  }
-
-  function updateRepeatButton() {
-    const button = document.querySelector(`#${PANEL_ID} [data-gdfp="repeat-toggle"]`);
-    if (!button) return;
-    const label = repeatMode.toUpperCase();
-    button.textContent = `Repeat: ${label}`;
-    button.setAttribute('aria-label', `Repeat mode ${label}. Click to cycle Off, All, One.`);
-    button.setAttribute('aria-pressed', String(repeatMode !== 'off'));
-    button.style.background = repeatMode === 'off' ? 'rgba(255,255,255,.11)' : repeatMode === 'all' ? 'rgba(138,180,248,.22)' : 'rgba(196,181,253,.22)';
-  }
-
-  function renderPlaybackState(detail = '') {
-    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="playback-status"]`);
-    if (!box) return;
-    const name = currentIndex >= 0 && playlist[currentIndex] ? playlist[currentIndex].name : '—';
-    const position = currentIndex >= 0 && playlist.length ? `${currentIndex + 1}/${playlist.length}` : '—';
-    let engine = '—';
-    if (playbackKind === 'direct-media' && currentIndex >= 0) engine = `DIRECT ${directLabel(playlist[currentIndex])}`;
-    else if (playbackKind === 'preview') engine = 'DRIVE PREVIEW';
-    box.textContent = `Continuous: ${autoMode ? 'ON' : 'OFF'} | Mode: ${(playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED'} | Repeat: ${repeatMode.toUpperCase()} | Engine: ${engine} | Track: ${position} | ${detail}\n${name}`;
-  }
-
-  function renderQueuePreview(queue = playlist, activeIndex = currentIndex) {
-    const box = document.querySelector(`#${PANEL_ID} [data-gdfp="queue"]`);
-    if (!box) return;
-    if (!queue.length) {
-      box.textContent = `Queue: not built yet. Repeat ${repeatMode.toUpperCase()}.`;
+  function renderQueue() {
+    const node = document.querySelector(`#${PANEL_ID} [data-gdfp="queue"]`);
+    if (!node) return;
+    if (!playlist.length) {
+      node.textContent = discoveredItems.length
+        ? `Full-folder cache ready: ${discoveredItems.length} item(s). Build a queue to play.`
+        : 'No full-folder cache yet.';
       return;
     }
-    const mode = (queue === playlist && playlist.length ? playlistShuffled : shuffleMode) ? 'SHUFFLE' : 'ORDERED';
-    let start = activeIndex >= 0 ? activeIndex : 0;
-    if (start >= queue.length) start = Math.max(0, queue.length - 1);
-    const lines = [`Queue ${mode}: ${queue.length} track(s) · Repeat ${repeatMode.toUpperCase()}`];
-    const end = Math.min(queue.length, start + 7);
-    for (let i = start; i < end; i += 1) {
-      const engine = isDirectMedia(queue[i]) ? directLabel(queue[i]) : 'Preview';
-      lines.push(`${i === activeIndex ? '▶' : ' '} ${i + 1}. [${engine}] ${queue[i].name}`);
-    }
-    if (end < queue.length) lines.push(`… +${queue.length - end} later`);
-    box.textContent = lines.join('\n');
+    const start = currentIndex >= 0 ? currentIndex : 0;
+    const end = Math.min(playlist.length, start + 6);
+    const lines = [`Queue: ${playlist.length} track(s) · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()}`];
+    for (let i = start; i < end; i += 1) lines.push(`${i === currentIndex ? '▶' : ' '} ${i + 1}. [${labelOf(playlist[i])}] ${playlist[i].name}`);
+    if (end < playlist.length) lines.push(`… +${playlist.length - end} later`);
+    node.textContent = lines.join('\n');
   }
 
-  function renderResults() {
-    const count = document.querySelector(`#${PANEL_ID} [data-gdfp="count"]`);
-    const list = document.querySelector(`#${PANEL_ID} [data-gdfp="list"]`);
-    if (!count || !list) return;
-    const directCount = detectedItems.filter(isDirectMedia).length;
-    const mp3Count = detectedItems.filter(item => isDirectMedia(item) && mediaType(item) === 'mp3').length;
-    const webmCount = detectedItems.filter(item => isDirectMedia(item) && mediaType(item) === 'webm').length;
-    count.textContent = `${detectedItems.length} cached visible media item(s) · ${directCount} direct (${mp3Count} MP3 + ${webmCount} WebM)`;
-    list.replaceChildren();
-    for (const item of detectedItems.slice(0, 8)) {
-      const row = document.createElement('div');
-      row.textContent = `${isDirectMedia(item) ? `[${directLabel(item)}]` : '[Preview]'} ${item.name}`;
-      row.title = item.name;
-      Object.assign(row.style, { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' });
-      list.appendChild(row);
-    }
-    if (detectedItems.length > 8) {
-      const more = document.createElement('div');
-      more.textContent = `… +${detectedItems.length - 8} more`;
-      more.style.opacity = '0.7';
-      list.appendChild(more);
-    }
-  }
-
-  function makeButton(label, handler, dataRole = '') {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = label;
-    if (dataRole) button.dataset.gdfp = dataRole;
-    Object.assign(button.style, { border: '1px solid rgba(255,255,255,.28)', borderRadius: '7px', padding: '7px 10px', background: 'rgba(255,255,255,.11)', color: 'inherit', cursor: 'pointer', font: 'inherit' });
-    button.addEventListener('click', handler);
-    return button;
+  function button(label, handler, role = '') {
+    const node = document.createElement('button');
+    node.type = 'button';
+    node.textContent = label;
+    if (role) node.dataset.gdfp = role;
+    Object.assign(node.style, {
+      padding: '7px 10px', borderRadius: '7px', border: '1px solid rgba(255,255,255,.24)',
+      background: 'rgba(255,255,255,.10)', color: 'inherit', cursor: 'pointer', font: 'inherit'
+    });
+    node.addEventListener('click', handler);
+    return node;
   }
 
   function clampPanelPosition(panel, left, top) {
     const margin = 4;
     const maxLeft = Math.max(margin, window.innerWidth - panel.offsetWidth - margin);
     const maxTop = Math.max(margin, window.innerHeight - panel.offsetHeight - margin);
-    return { left: Math.min(maxLeft, Math.max(margin, left)), top: Math.min(maxTop, Math.max(margin, top)) };
+    return {
+      left: Math.min(maxLeft, Math.max(margin, left)),
+      top: Math.min(maxTop, Math.max(margin, top))
+    };
   }
 
   function enablePanelDragging(panel, handle) {
@@ -1053,6 +661,7 @@
     let offsetX = 0;
     let offsetY = 0;
     let previousBodyUserSelect = '';
+
     const finishDrag = event => {
       if (!dragging || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
       dragging = false;
@@ -1063,6 +672,7 @@
       } catch {}
       pointerId = null;
     };
+
     handle.addEventListener('pointerdown', event => {
       if (!event.isPrimary || event.button !== 0) return;
       const rect = panel.getBoundingClientRect();
@@ -1081,6 +691,7 @@
       try { handle.setPointerCapture?.(event.pointerId); } catch {}
       event.preventDefault();
     });
+
     handle.addEventListener('pointermove', event => {
       if (!dragging || event.pointerId !== pointerId) return;
       const position = clampPanelPosition(panel, event.clientX - offsetX, event.clientY - offsetY);
@@ -1088,9 +699,11 @@
       panel.style.top = `${position.top}px`;
       event.preventDefault();
     });
+
     handle.addEventListener('pointerup', finishDrag);
     handle.addEventListener('pointercancel', finishDrag);
     handle.addEventListener('lostpointercapture', finishDrag);
+
     window.addEventListener('resize', () => {
       if (panel.dataset.gdfpDragged !== 'true') return;
       const rect = panel.getBoundingClientRect();
@@ -1100,75 +713,92 @@
     });
   }
 
-  function mountPanel() {
-    if (document.getElementById(PANEL_ID)) return;
+  function mount() {
+    if (!document.body || document.getElementById(PANEL_ID)) return;
     const panel = document.createElement('section');
     panel.id = PANEL_ID;
-    Object.assign(panel.style, { position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '500px', maxHeight: '84vh', overflow: 'auto', boxSizing: 'border-box', padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)', color: '#f1f3f4', boxShadow: '0 8px 30px rgba(0,0,0,.32)', font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif' });
+    Object.assign(panel.style, {
+      position: 'fixed', right: '18px', bottom: '18px', zIndex: '2147483647', width: '540px', maxHeight: '84vh',
+      overflow: 'auto', boxSizing: 'border-box', padding: '12px', borderRadius: '12px', background: 'rgba(32,33,36,.97)',
+      color: '#f1f3f4', border: '1px solid rgba(255,255,255,.18)', boxShadow: '0 8px 30px rgba(0,0,0,.32)',
+      font: '13px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+    });
 
     const title = document.createElement('div');
     title.textContent = `Google Drive Folder Player — Probe ${VERSION}`;
     title.title = 'Drag this title bar to move the panel';
-    Object.assign(title.style, { fontWeight: '650', marginBottom: '8px', cursor: 'grab', userSelect: 'none', touchAction: 'none' });
+    Object.assign(title.style, {
+      fontWeight: '650', marginBottom: '7px', cursor: 'grab', userSelect: 'none', touchAction: 'none'
+    });
 
-    const status = document.createElement('div');
-    status.dataset.gdfp = 'status';
-    status.textContent = 'Ready. Scan the folder, choose Shuffle/Repeat, then start unified direct playback.';
-    status.style.marginBottom = '9px';
+    const note = document.createElement('div');
+    note.textContent = '0.0.24 integrates verified full-folder MP3/WebM discovery with the validated direct-media/preload player. The current Music-folder baseline is 160 files (144 MP3 + 16 WebM).';
+    note.style.opacity = '0.78';
+    note.style.marginBottom = '8px';
 
     const controls = document.createElement('div');
     Object.assign(controls.style, { display: 'flex', gap: '7px', flexWrap: 'wrap', marginBottom: '9px' });
     controls.append(
-      makeButton('Scan folder view', scanCurrentView),
-      makeButton('Shuffle: OFF', toggleShuffle, 'shuffle-toggle'),
-      makeButton('Repeat: OFF', toggleRepeat, 'repeat-toggle'),
-      makeButton('Start direct player', startContinuousTest),
-      makeButton('Next now', nextNow),
-      makeButton('Seek last 5s', seekCurrentToLast5s),
-      makeButton('Stop', stopContinuousTest),
-      makeButton('Probe transition', probeTransition)
+      button('Discover full folder', () => void discoverFullFolder()),
+      button('Stop discovery', stopDiscovery),
+      button('Shuffle: OFF', toggleShuffle, 'shuffle'),
+      button('Repeat: OFF', toggleRepeat, 'repeat'),
+      button('Start full queue', () => void startQueue()),
+      button('Next now', () => void nextNow()),
+      button('Seek last 5s', seekLast5s),
+      button('Stop playback', stopPlayback)
     );
 
+    const summary = document.createElement('div');
+    summary.dataset.gdfp = 'summary';
+    Object.assign(summary.style, {
+      marginBottom: '8px', padding: '8px', borderRadius: '7px',
+      background: 'rgba(129,201,149,.10)', border: '1px solid rgba(129,201,149,.20)'
+    });
+
+    const status = document.createElement('div');
+    status.dataset.gdfp = 'status';
+    status.textContent = 'Ready. Discover the full folder, choose Shuffle/Repeat, then start the full queue.';
+    Object.assign(status.style, {
+      marginBottom: '8px', padding: '8px', borderRadius: '7px',
+      background: 'rgba(129,201,149,.10)', border: '1px solid rgba(129,201,149,.20)'
+    });
+
     const playback = document.createElement('div');
-    playback.dataset.gdfp = 'playback-status';
-    playback.textContent = 'Continuous: OFF | Mode: ORDERED | Repeat: OFF | Engine: — | Track: —';
-    Object.assign(playback.style, { marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap', background: 'rgba(129,201,149,.12)', border: '1px solid rgba(129,201,149,.28)', overflowWrap: 'anywhere' });
+    playback.dataset.gdfp = 'playback';
+    Object.assign(playback.style, {
+      marginBottom: '8px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      background: 'rgba(138,180,248,.10)', border: '1px solid rgba(138,180,248,.22)', overflowWrap: 'anywhere'
+    });
 
     const queue = document.createElement('div');
     queue.dataset.gdfp = 'queue';
-    queue.textContent = 'Queue: not built yet. Repeat OFF.';
-    Object.assign(queue.style, { marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap', background: 'rgba(251,188,4,.09)', border: '1px solid rgba(251,188,4,.24)', overflowWrap: 'anywhere', fontSize: '11px' });
+    Object.assign(queue.style, {
+      marginBottom: '8px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
+      background: 'rgba(251,188,4,.08)', border: '1px solid rgba(251,188,4,.20)', overflowWrap: 'anywhere', fontSize: '11px'
+    });
 
-    const diagnostic = document.createElement('div');
-    diagnostic.dataset.gdfp = 'diagnostic';
-    diagnostic.textContent = 'Transition history will appear here.';
-    Object.assign(diagnostic.style, { marginBottom: '9px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap', background: 'rgba(138,180,248,.12)', border: '1px solid rgba(138,180,248,.28)', overflowWrap: 'anywhere', fontSize: '11px' });
+    const logBox = document.createElement('div');
+    logBox.dataset.gdfp = 'log';
+    Object.assign(logBox.style, {
+      whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', padding: '8px', borderRadius: '7px',
+      background: 'rgba(138,180,248,.10)', border: '1px solid rgba(138,180,248,.22)', minHeight: '160px', fontSize: '11px'
+    });
 
-    const count = document.createElement('div');
-    count.dataset.gdfp = 'count';
-    count.textContent = 'Not scanned yet';
-    count.style.fontWeight = '600';
-    count.style.marginBottom = '5px';
-
-    const list = document.createElement('div');
-    list.dataset.gdfp = 'list';
-    Object.assign(list.style, { display: 'grid', gap: '2px' });
-
-    const note = document.createElement('div');
-    note.textContent = 'Probe 0.0.23 integrates the validated Direct Media Core into the full player. MP3 and WebM with stable Drive IDs use direct media + one-track preload with no Drive Preview. Other supported media formats retain the validated Drive Preview fallback. Shuffle, Repeat, Next, draggable panel and background playback remain active. Full-folder discovery is intentionally still out of scope.';
-    Object.assign(note.style, { marginTop: '9px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,.16)', opacity: '0.65', fontSize: '11px' });
-
-    panel.append(title, status, controls, playback, queue, diagnostic, count, list, note);
+    panel.append(title, note, controls, summary, status, playback, queue, logBox);
     document.body.appendChild(panel);
     enablePanelDragging(panel, title);
-    updateShuffleButton();
-    updateRepeatButton();
-    log(`Probe ${VERSION} mounted. Unified direct player ready; authuser=${authuserIndex()}.`);
+    renderDiscoverySummary();
+    renderPlayback();
+    renderQueue();
+    updateButtons();
+    setInterval(renderPlayback, 300);
+    log(`Probe ${VERSION} mounted; full-folder direct player ready; authuser=${authuserIndex()}.`);
   }
 
   function init() {
     if (!document.body) return setTimeout(init, 100);
-    mountPanel();
+    mount();
   }
 
   init();

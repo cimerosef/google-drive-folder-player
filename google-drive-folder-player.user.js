@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.26
-// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, Previous/Pause/Next, Shuffle and Repeat.
+// @version      0.0.27
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, track selection, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.26';
+  const VERSION = '0.0.27';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -573,6 +573,37 @@
     await playIndex(next, 'Next');
   }
 
+  async function playSelectedTrack(itemId) {
+    if (discoveryRunning || advancing) return;
+
+    const discoveredIndex = discoveredItems.findIndex(item => item.id === itemId);
+    if (discoveredIndex < 0) {
+      setStatus('Selected track is no longer available in the scanned folder.');
+      return;
+    }
+
+    let targetIndex = playlist.findIndex(item => item.id === itemId);
+
+    if (targetIndex < 0) {
+      if (shuffleMode) {
+        const selected = { ...discoveredItems[discoveredIndex] };
+        const remaining = shuffleCopy(discoveredItems.filter(item => item.id !== itemId));
+        playlist = [selected, ...remaining];
+        targetIndex = 0;
+        log(`Queue built from selected track: ${playlist.length} track(s), mode=SHUFFLE.`);
+      } else {
+        playlist = discoveredItems.map(item => ({ ...item }));
+        targetIndex = discoveredIndex;
+        log(`Queue built from selected track: ${playlist.length} track(s), mode=ORDERED, start=${targetIndex + 1}.`);
+      }
+    }
+
+    autoMode = true;
+    renderDiscoverySummary();
+    renderQueue();
+    await playIndex(targetIndex, 'double-click selection');
+  }
+
   async function togglePause() {
     const media = directCurrent?.media;
     const item = playlist[currentIndex];
@@ -738,18 +769,74 @@
   function renderQueue() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="queue"]`);
     if (!node) return;
-    if (!playlist.length) {
-      node.textContent = discoveredItems.length
-        ? `${discoveredItems.length} tracks ready. Press Start.`
-        : 'Scan the folder to build the library.';
+
+    const previousList = node.querySelector('[data-gdfp="track-list"]');
+    const previousScrollTop = previousList?.scrollTop || 0;
+    const items = playlist.length ? playlist : discoveredItems;
+    const usingQueue = playlist.length > 0;
+
+    node.replaceChildren();
+
+    if (!items.length) {
+      node.textContent = 'Scan the folder to build the library.';
       return;
     }
-    const start = currentIndex >= 0 ? currentIndex : 0;
-    const end = Math.min(playlist.length, start + 5);
-    const lines = [`${playlist.length} tracks · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()}`];
-    for (let i = start; i < end; i += 1) lines.push(`${i === currentIndex ? '▶' : ' '} ${i + 1}. [${labelOf(playlist[i])}] ${playlist[i].name}`);
-    if (end < playlist.length) lines.push(`… +${playlist.length - end} more`);
-    node.textContent = lines.join('\n');
+
+    const heading = document.createElement('div');
+    heading.textContent = usingQueue
+      ? `${playlist.length} tracks · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()} · double-click to play`
+      : `${discoveredItems.length} scanned tracks · double-click a track to start`;
+    Object.assign(heading.style, {
+      marginBottom: '6px', fontSize: '11px', opacity: '0.72'
+    });
+
+    const list = document.createElement('div');
+    list.dataset.gdfp = 'track-list';
+    Object.assign(list.style, {
+      maxHeight: '250px', overflowY: 'auto', overflowX: 'hidden',
+      borderRadius: '6px', background: 'rgba(0,0,0,.10)'
+    });
+
+    let activeRow = null;
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      const isCurrent = usingQueue && directCurrent && i === currentIndex;
+      const baseBackground = isCurrent ? 'rgba(138,180,248,.20)' : 'transparent';
+
+      row = document.createElement('div');
+      row.textContent = `${isCurrent ? '▶ ' : ''}${i + 1}. [${labelOf(item)}] ${item.name}`;
+      row.title = 'Double-click to play this track';
+      Object.assign(row.style, {
+        padding: '5px 7px', borderBottom: '1px solid rgba(255,255,255,.06)',
+        background: baseBackground, cursor: 'pointer', overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        fontWeight: isCurrent ? '650' : '400'
+      });
+      row.addEventListener('mouseenter', () => {
+        row.style.background = isCurrent ? 'rgba(138,180,248,.28)' : 'rgba(255,255,255,.08)';
+      });
+      row.addEventListener('mouseleave', () => {
+        row.style.background = baseBackground;
+      });
+      row.addEventListener('dblclick', event => {
+        event.preventDefault();
+        void playSelectedTrack(item.id);
+      });
+
+      if (isCurrent) activeRow = row;
+      list.appendChild(row);
+    }
+
+    node.append(heading, list);
+
+    requestAnimationFrame(() => {
+      list.scrollTop = previousScrollTop;
+      if (!activeRow) return;
+      const listRect = list.getBoundingClientRect();
+      const rowRect = activeRow.getBoundingClientRect();
+      if (rowRect.top < listRect.top) list.scrollTop += rowRect.top - listRect.top - 4;
+      else if (rowRect.bottom > listRect.bottom) list.scrollTop += rowRect.bottom - listRect.bottom + 4;
+    });
   }
 
   function button(label, handler, role = '') {
@@ -946,7 +1033,7 @@
     queue.dataset.gdfp = 'queue';
     Object.assign(queue.style, {
       marginBottom: '7px', padding: '8px', borderRadius: '7px', whiteSpace: 'pre-wrap',
-      background: 'rgba(251,188,4,.08)', border: '1px solid rgba(251,188,4,.20)', overflowWrap: 'anywhere', fontSize: '11px'
+      background: 'rgba(251,188,4,.08)', border: '1px solid rgba(251,188,4,.20)', overflow: 'hidden', fontSize: '11px'
     });
 
     const debug = document.createElement('details');

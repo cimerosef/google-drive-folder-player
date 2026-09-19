@@ -803,7 +803,7 @@
       const isCurrent = usingQueue && directCurrent && i === currentIndex;
       const baseBackground = isCurrent ? 'rgba(138,180,248,.20)' : 'transparent';
 
-      row = document.createElement('div');
+      const row = document.createElement('div');
       row.textContent = `${isCurrent ? '▶ ' : ''}${i + 1}. [${labelOf(item)}] ${item.name}`;
       row.title = 'Double-click to play this track';
       Object.assign(row.style, {

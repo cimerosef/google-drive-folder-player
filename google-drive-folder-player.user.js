@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.27
-// @description  Play a complete Google Drive MP3/WebM folder with direct playback, preload, track selection, Previous/Pause/Next, Shuffle and Repeat.
+// @version      0.0.28
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.27';
+  const VERSION = '0.0.28';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -35,6 +35,7 @@
   let directNext = null;
   let transitionRequestedAt = 0;
   let logLines = [];
+  let trackSearchQuery = '';
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -766,6 +767,14 @@
     node.textContent = `${state} ${currentIndex + 1}/${playlist.length} · ${labelOf(current)} · ${percent}% · ${preload}\n${current.name}`;
   }
 
+  function normalizeTrackSearch(value) {
+    return String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLocaleLowerCase()
+      .trim();
+  }
+
   function renderQueue() {
     const node = document.querySelector(`#${PANEL_ID} [data-gdfp="queue"]`);
     if (!node) return;
@@ -783,12 +792,42 @@
     }
 
     const heading = document.createElement('div');
-    heading.textContent = usingQueue
-      ? `${playlist.length} tracks · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()} · double-click to play`
-      : `${discoveredItems.length} scanned tracks · double-click a track to start`;
     Object.assign(heading.style, {
       marginBottom: '6px', fontSize: '11px', opacity: '0.72'
     });
+
+    const searchBar = document.createElement('div');
+    Object.assign(searchBar.style, {
+      display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '7px'
+    });
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    searchInput.value = trackSearchQuery;
+    searchInput.placeholder = 'Search tracks…';
+    searchInput.setAttribute('aria-label', 'Search tracks');
+    searchInput.autocomplete = 'off';
+    searchInput.spellcheck = false;
+    Object.assign(searchInput.style, {
+      flex: '1 1 auto', minWidth: '0', boxSizing: 'border-box',
+      padding: '6px 8px', borderRadius: '6px',
+      border: '1px solid rgba(255,255,255,.20)',
+      background: 'rgba(255,255,255,.08)', color: 'inherit',
+      outline: 'none', font: 'inherit'
+    });
+
+    const clearSearch = document.createElement('button');
+    clearSearch.type = 'button';
+    clearSearch.textContent = '×';
+    clearSearch.title = 'Clear search';
+    clearSearch.setAttribute('aria-label', 'Clear search');
+    Object.assign(clearSearch.style, {
+      flex: '0 0 auto', width: '30px', height: '30px', padding: '0',
+      borderRadius: '6px', border: '1px solid rgba(255,255,255,.20)',
+      background: 'rgba(255,255,255,.08)', color: 'inherit',
+      cursor: 'pointer', font: '700 16px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+    });
+    searchBar.append(searchInput, clearSearch);
 
     const list = document.createElement('div');
     list.dataset.gdfp = 'track-list';
@@ -797,46 +836,99 @@
       borderRadius: '6px', background: 'rgba(0,0,0,.10)'
     });
 
-    let activeRow = null;
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i];
-      const isCurrent = usingQueue && directCurrent && i === currentIndex;
-      const baseBackground = isCurrent ? 'rgba(138,180,248,.20)' : 'transparent';
+    const renderFilteredRows = (resetScroll = false) => {
+      const query = normalizeTrackSearch(trackSearchQuery);
+      const filtered = query
+        ? items.map((item, index) => ({ item, index }))
+          .filter(entry => normalizeTrackSearch(entry.item.name).includes(query))
+        : items.map((item, index) => ({ item, index }));
 
-      const row = document.createElement('div');
-      row.textContent = `${isCurrent ? '▶ ' : ''}${i + 1}. [${labelOf(item)}] ${item.name}`;
-      row.title = 'Double-click to play this track';
-      Object.assign(row.style, {
-        padding: '5px 7px', borderBottom: '1px solid rgba(255,255,255,.06)',
-        background: baseBackground, cursor: 'pointer', overflow: 'hidden',
-        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        fontWeight: isCurrent ? '650' : '400'
-      });
-      row.addEventListener('mouseenter', () => {
-        row.style.background = isCurrent ? 'rgba(138,180,248,.28)' : 'rgba(255,255,255,.08)';
-      });
-      row.addEventListener('mouseleave', () => {
-        row.style.background = baseBackground;
-      });
-      row.addEventListener('dblclick', event => {
-        event.preventDefault();
-        void playSelectedTrack(item.id);
-      });
+      heading.textContent = usingQueue
+        ? `${filtered.length === items.length ? items.length : `${filtered.length}/${items.length}`} tracks · ${shuffleMode ? 'SHUFFLE' : 'ORDERED'} · Repeat ${repeatMode.toUpperCase()} · double-click to play`
+        : `${filtered.length === items.length ? items.length : `${filtered.length}/${items.length}`} scanned tracks · double-click a track to start`;
 
-      if (isCurrent) activeRow = row;
-      list.appendChild(row);
-    }
+      clearSearch.style.opacity = trackSearchQuery ? '1' : '0.45';
+      clearSearch.style.cursor = trackSearchQuery ? 'pointer' : 'default';
 
-    node.append(heading, list);
+      list.replaceChildren();
 
-    requestAnimationFrame(() => {
-      list.scrollTop = previousScrollTop;
-      if (!activeRow) return;
-      const listRect = list.getBoundingClientRect();
-      const rowRect = activeRow.getBoundingClientRect();
-      if (rowRect.top < listRect.top) list.scrollTop += rowRect.top - listRect.top - 4;
-      else if (rowRect.bottom > listRect.bottom) list.scrollTop += rowRect.bottom - listRect.bottom + 4;
+      if (!filtered.length) {
+        const empty = document.createElement('div');
+        empty.textContent = 'No matching tracks.';
+        Object.assign(empty.style, {
+          padding: '10px 8px', opacity: '0.65', textAlign: 'center'
+        });
+        list.appendChild(empty);
+        return;
+      }
+
+      let activeRow = null;
+      for (const { item, index } of filtered) {
+        const isCurrent = usingQueue && directCurrent && index === currentIndex;
+        const baseBackground = isCurrent ? 'rgba(138,180,248,.20)' : 'transparent';
+
+        const row = document.createElement('div');
+        row.textContent = `${isCurrent ? '▶ ' : ''}${index + 1}. [${labelOf(item)}] ${item.name}`;
+        row.title = 'Double-click to play this track';
+        Object.assign(row.style, {
+          padding: '5px 7px', borderBottom: '1px solid rgba(255,255,255,.06)',
+          background: baseBackground, cursor: 'pointer', overflow: 'hidden',
+          textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          fontWeight: isCurrent ? '650' : '400'
+        });
+        row.addEventListener('mouseenter', () => {
+          row.style.background = isCurrent ? 'rgba(138,180,248,.28)' : 'rgba(255,255,255,.08)';
+        });
+        row.addEventListener('mouseleave', () => {
+          row.style.background = baseBackground;
+        });
+        row.addEventListener('dblclick', event => {
+          event.preventDefault();
+          void playSelectedTrack(item.id);
+        });
+
+        if (isCurrent) activeRow = row;
+        list.appendChild(row);
+      }
+
+      requestAnimationFrame(() => {
+        if (resetScroll) list.scrollTop = 0;
+        else list.scrollTop = previousScrollTop;
+
+        if (!activeRow || resetScroll) return;
+        const listRect = list.getBoundingClientRect();
+        const rowRect = activeRow.getBoundingClientRect();
+        if (rowRect.top < listRect.top) list.scrollTop += rowRect.top - listRect.top - 4;
+        else if (rowRect.bottom > listRect.bottom) list.scrollTop += rowRect.bottom - listRect.bottom + 4;
+      });
+    };
+
+    searchInput.addEventListener('input', () => {
+      trackSearchQuery = searchInput.value;
+      renderFilteredRows(true);
     });
+
+    searchInput.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || !trackSearchQuery) return;
+      event.preventDefault();
+      trackSearchQuery = '';
+      searchInput.value = '';
+      renderFilteredRows(true);
+    });
+
+    clearSearch.addEventListener('click', () => {
+      if (!trackSearchQuery) {
+        searchInput.focus();
+        return;
+      }
+      trackSearchQuery = '';
+      searchInput.value = '';
+      renderFilteredRows(true);
+      searchInput.focus();
+    });
+
+    node.append(heading, searchBar, list);
+    renderFilteredRows(false);
   }
 
   function button(label, handler, role = '') {

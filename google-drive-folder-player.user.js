@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.28
+// @version      0.0.29
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.28';
+  const VERSION = '0.0.29';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -236,8 +236,20 @@
 
     const scroller = findScrollContainer();
     if (!scroller) {
+      const found = new Map();
+      const sample = addRowsToMap(found);
+      if (found.size) {
+        discoveredItems = [...found.values()];
+        const mp3 = discoveredItems.filter(item => item.type === 'mp3').length;
+        const webm = discoveredItems.filter(item => item.type === 'webm').length;
+        setStatus(`Folder ready: ${discoveredItems.length} tracks (${mp3} MP3, ${webm} WebM).`);
+        log(`Discovery completed without scrolling: rendered=${sample.rows.length}, unique=${found.size}; ${mp3} MP3, ${webm} WebM.`);
+        renderDiscoverySummary();
+        renderQueue();
+        return true;
+      }
       setStatus('Could not identify the Drive folder list.');
-      log('Discovery aborted: no scroll container found.');
+      log('Discovery aborted: no scroll container or rendered media rows found.');
       return false;
     }
 

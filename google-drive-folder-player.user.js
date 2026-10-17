@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.32
+// @version      0.0.33
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, system media controls, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.32';
+  const VERSION = '0.0.33';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -31,6 +31,7 @@
   let advancing = false;
   let discoveryRunning = false;
   let stopDiscoveryRequested = false;
+  let directPrevious = null;
   let directCurrent = null;
   let directNext = null;
   let transitionRequestedAt = 0;
@@ -437,10 +438,27 @@
     } catch {}
   }
 
+  function clearPrevious() {
+    if (!directPrevious) return;
+    disposeMedia(directPrevious.media);
+    directPrevious = null;
+  }
+
   function clearNext() {
     if (!directNext) return;
     disposeMedia(directNext.media);
     directNext = null;
+  }
+
+  function resetCachedSlot(slot, role) {
+    if (!slot?.media) return null;
+    try {
+      slot.media.pause();
+      slot.media.currentTime = 0;
+    } catch {}
+    slot.role = role;
+    slot.ready = slot.media.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+    return slot;
   }
 
   function clearCurrent() {
@@ -450,6 +468,7 @@
   }
 
   function clearMedia() {
+    clearPrevious();
     clearCurrent();
     clearNext();
   }
@@ -550,15 +569,25 @@
     advancing = true;
     const target = playlist[index];
     const oldCurrent = directCurrent;
+    const oldIndex = oldCurrent?.index ?? -1;
     let slot;
     let promoted = false;
+    let promotedFrom = '';
 
     try {
-      if (directNext && directNext.index === index && directNext.item.id === target.id && !directNext.failed) {
+      if (directPrevious && directPrevious.index === index && directPrevious.item.id === target.id && !directPrevious.failed) {
+        slot = directPrevious;
+        directPrevious = null;
+        resetCachedSlot(slot, 'current');
+        promoted = true;
+        promotedFrom = 'previous cache';
+        log(`Promoting cached previous ${index + 1}/${playlist.length}.`);
+      } else if (directNext && directNext.index === index && directNext.item.id === target.id && !directNext.failed) {
         slot = directNext;
         directNext = null;
         slot.role = 'current';
         promoted = true;
+        promotedFrom = 'preload';
         log(`Promoting preloaded ${index + 1}/${playlist.length}.`);
       } else {
         slot = createSlot(target, index, 'current');
@@ -580,12 +609,35 @@
       transitionRequestedAt = performance.now();
       autoMode = true;
       await slot.media.play();
-      if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
+
+      if (oldCurrent && oldCurrent !== slot) {
+        const movedForwardOne =
+          oldIndex === index - 1 ||
+          (repeatMode === 'all' && index === 0 && oldIndex === playlist.length - 1);
+        const movedBackwardOne =
+          oldIndex === index + 1 ||
+          (repeatMode === 'all' && index === playlist.length - 1 && oldIndex === 0);
+
+        if (movedForwardOne) {
+          clearPrevious();
+          directPrevious = resetCachedSlot(oldCurrent, 'previous');
+          log(`Cached previous ${oldIndex + 1}/${playlist.length} for instant back navigation.`);
+        } else if (movedBackwardOne) {
+          clearNext();
+          directNext = resetCachedSlot(oldCurrent, 'next');
+          log(`Reused former current ${oldIndex + 1}/${playlist.length} as next cache.`);
+        } else {
+          disposeMedia(oldCurrent.media);
+          clearPrevious();
+        }
+      }
+
       currentIndex = index;
       syncMediaSessionMetadata(target);
       syncMediaSessionPlaybackState();
-      setStatus(`Playing ${index + 1}/${playlist.length}${promoted ? ' · preloaded' : ''}: ${target.name}`);
-      log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promoted ? ' from preload' : ''}.`);
+      const sourceNote = promotedFrom ? ` · ${promotedFrom}` : '';
+      setStatus(`Playing ${index + 1}/${playlist.length}${sourceNote}: ${target.name}`);
+      log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promotedFrom ? ` from ${promotedFrom}` : ''}.`);
       prepareNext();
       renderPlayback();
       renderQueue();

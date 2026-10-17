@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.29
-// @description  Play a complete Google Drive MP3/WebM folder with direct playback, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
+// @version      0.0.30
+// @description  Play a complete Google Drive MP3/WebM folder with direct playback, system media controls, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
 // @grant        none
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.29';
+  const VERSION = '0.0.30';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -57,6 +57,77 @@
 
   function labelOf(item) {
     return extensionOf(item?.name).toUpperCase();
+  }
+
+  function mediaSessionAvailable() {
+    return 'mediaSession' in navigator;
+  }
+
+  function mediaTitleOf(item) {
+    return String(item?.name || '').replace(/\.(?:mp3|webm)$/i, '');
+  }
+
+  function syncMediaSessionMetadata(item = playlist[currentIndex]) {
+    if (!mediaSessionAvailable() || typeof MediaMetadata !== 'function') return;
+    try {
+      navigator.mediaSession.metadata = item ? new MediaMetadata({
+        title: mediaTitleOf(item),
+        artist: 'Google Drive',
+        album: 'Google Drive Folder Player'
+      }) : null;
+    } catch (error) {
+      log(`Media Session metadata update failed: ${error?.name || 'Error'}.`);
+    }
+  }
+
+  function syncMediaSessionPlaybackState() {
+    if (!mediaSessionAvailable()) return;
+    const media = directCurrent?.media;
+    const hasCurrent = Boolean(media && currentIndex >= 0 && playlist[currentIndex] && !media.ended);
+    const state = hasCurrent ? (media.paused ? 'paused' : 'playing') : 'none';
+    try {
+      navigator.mediaSession.playbackState = state;
+    } catch {}
+  }
+
+  function clearMediaSession() {
+    if (!mediaSessionAvailable()) return;
+    try {
+      navigator.mediaSession.playbackState = 'none';
+      if (typeof MediaMetadata === 'function') navigator.mediaSession.metadata = null;
+      if (typeof navigator.mediaSession.setPositionState === 'function') navigator.mediaSession.setPositionState();
+    } catch {}
+  }
+
+  function setupMediaSession() {
+    if (!mediaSessionAvailable()) {
+      log('Media Session API unavailable; system media controls disabled.');
+      return;
+    }
+
+    const handlers = {
+      play: () => {
+        const media = directCurrent?.media;
+        if (media?.paused && !media.ended) void togglePause();
+      },
+      pause: () => {
+        const media = directCurrent?.media;
+        if (media && !media.paused && !media.ended) void togglePause();
+      },
+      previoustrack: () => void previousNow(),
+      nexttrack: () => void nextNow()
+    };
+
+    let registered = 0;
+    for (const [action, handler] of Object.entries(handlers)) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+        registered += 1;
+      } catch (error) {
+        log(`Media Session action unsupported: ${action} (${error?.name || 'Error'}).`);
+      }
+    }
+    log(`Media Session ready: ${registered}/4 action handler(s) registered.`);
   }
 
   function extractName(element) {
@@ -404,12 +475,16 @@
       }
       if (slot === directCurrent) {
         autoMode = true;
+        syncMediaSessionPlaybackState();
         updateTransportButtons();
         renderDiscoverySummary();
       }
     });
     media.addEventListener('pause', () => {
-      if (slot === directCurrent && !media.ended) updateTransportButtons();
+      if (slot === directCurrent && !media.ended) {
+        syncMediaSessionPlaybackState();
+        updateTransportButtons();
+      }
     });
     media.addEventListener('ended', () => {
       if (directCurrent !== slot || currentIndex !== index) return;
@@ -499,6 +574,8 @@
       await slot.media.play();
       if (oldCurrent && oldCurrent !== slot) disposeMedia(oldCurrent.media);
       currentIndex = index;
+      syncMediaSessionMetadata(target);
+      syncMediaSessionPlaybackState();
       setStatus(`Playing ${index + 1}/${playlist.length}${promoted ? ' · preloaded' : ''}: ${target.name}`);
       log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promoted ? ' from preload' : ''}.`);
       prepareNext();
@@ -680,6 +757,7 @@
       else {
         autoMode = false;
         clearNext();
+        clearMediaSession();
         setStatus(`Queue finished (${playlist.length} tracks).`);
         renderPlayback();
         renderDiscoverySummary();
@@ -694,6 +772,7 @@
     autoMode = false;
     transitionRequestedAt = 0;
     clearMedia();
+    clearMediaSession();
     setStatus('Playback stopped.');
     renderPlayback();
     renderDiscoverySummary();
@@ -1204,6 +1283,7 @@
     renderPlayback();
     renderQueue();
     updateButtons();
+    setupMediaSession();
     setInterval(renderPlayback, 300);
     applyMinimizedState(minimized);
     log(`Version ${VERSION} mounted; full-folder direct player ready; authuser=${authuserIndex()}.`);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.30
+// @version      0.0.31
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, system media controls, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.30';
+  const VERSION = '0.0.31';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -36,6 +36,7 @@
   let transitionRequestedAt = 0;
   let logLines = [];
   let trackSearchQuery = '';
+  let lastMediaSessionPositionSyncAt = 0;
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -90,7 +91,28 @@
     } catch {}
   }
 
+  function syncMediaSessionPosition(media = directCurrent?.media, force = false) {
+    if (!mediaSessionAvailable() || typeof navigator.mediaSession.setPositionState !== 'function' || !media) return;
+    const now = performance.now();
+    if (!force && now - lastMediaSessionPositionSyncAt < 4500) return;
+    const duration = Number(media.duration);
+    const currentTime = Number(media.currentTime);
+    const playbackRate = Number(media.playbackRate) || 1;
+    if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(currentTime)) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration,
+        playbackRate,
+        position: Math.min(duration, Math.max(0, currentTime))
+      });
+      lastMediaSessionPositionSyncAt = now;
+    } catch (error) {
+      if (force) log(`Media Session position update failed: ${error?.name || 'Error'}.`);
+    }
+  }
+
   function clearMediaSession() {
+    lastMediaSessionPositionSyncAt = 0;
     if (!mediaSessionAvailable()) return;
     try {
       navigator.mediaSession.playbackState = 'none';
@@ -458,7 +480,13 @@
     const media = createMedia(item);
     const slot = { media, item: { ...item }, index, role, ready: false, failed: false };
 
-    media.addEventListener('loadedmetadata', () => log(`${slot.role} ${labelOf(item)} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`));
+    media.addEventListener('loadedmetadata', () => {
+      log(`${slot.role} ${labelOf(item)} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`);
+      if (slot === directCurrent) {
+        syncMediaSessionMetadata(slot.item);
+        syncMediaSessionPosition(media, true);
+      }
+    });
     media.addEventListener('canplay', () => {
       slot.ready = true;
       renderPlayback();
@@ -475,7 +503,9 @@
       }
       if (slot === directCurrent) {
         autoMode = true;
+        syncMediaSessionMetadata(slot.item);
         syncMediaSessionPlaybackState();
+        syncMediaSessionPosition(media, true);
         updateTransportButtons();
         renderDiscoverySummary();
       }
@@ -483,8 +513,12 @@
     media.addEventListener('pause', () => {
       if (slot === directCurrent && !media.ended) {
         syncMediaSessionPlaybackState();
+        syncMediaSessionPosition(media, true);
         updateTransportButtons();
       }
+    });
+    media.addEventListener('timeupdate', () => {
+      if (slot === directCurrent && !media.paused && !media.ended) syncMediaSessionPosition(media);
     });
     media.addEventListener('ended', () => {
       if (directCurrent !== slot || currentIndex !== index) return;
@@ -569,6 +603,9 @@
       }
 
       if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
+      setupMediaSession();
+      syncMediaSessionMetadata(target);
+      lastMediaSessionPositionSyncAt = 0;
       transitionRequestedAt = performance.now();
       autoMode = true;
       await slot.media.play();
@@ -576,6 +613,7 @@
       currentIndex = index;
       syncMediaSessionMetadata(target);
       syncMediaSessionPlaybackState();
+      syncMediaSessionPosition(slot.media, true);
       setStatus(`Playing ${index + 1}/${playlist.length}${promoted ? ' · preloaded' : ''}: ${target.name}`);
       log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promoted ? ' from preload' : ''}.`);
       prepareNext();

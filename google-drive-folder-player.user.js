@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.33
+// @version      0.0.34
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, system media controls, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.33';
+  const VERSION = '0.0.34';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -595,12 +595,43 @@
       }
 
       directCurrent = slot;
-      const ready = await waitReady(slot, promoted ? 6000 : 10000);
-      if (!ready || slot.failed) {
-        if (directCurrent === slot) directCurrent = oldCurrent;
+      let ready = await waitReady(slot, promoted ? 6000 : 10000);
+
+      if ((!ready || slot.failed) && promoted) {
+        log(`Promoted ${promotedFrom || 'cached'} slot unavailable for ${index + 1}/${playlist.length}; retrying with fresh media.`);
+        if (directCurrent === slot) directCurrent = null;
         disposeMedia(slot.media);
-        setStatus(`Track could not be loaded: ${target.name}`);
+
+        slot = createSlot(target, index, 'current');
+        promoted = false;
+        promotedFrom = 'fresh retry';
+        directCurrent = slot;
+        ready = await waitReady(slot, 10000);
+      }
+
+      if (!ready || slot.failed) {
+        const oldStillPlayable = Boolean(oldCurrent?.media && !oldCurrent.media.ended);
+        if (directCurrent === slot) directCurrent = oldStillPlayable ? oldCurrent : null;
+        disposeMedia(slot.media);
+        transitionRequestedAt = 0;
+
+        if (!oldStillPlayable) {
+          autoMode = false;
+          clearNext();
+          clearMediaSession();
+        }
+
+        setStatus(`Track could not be loaded after retry: ${target.name}`);
+        log(`Load failed after recovery attempt for ${index + 1}/${playlist.length}: ${target.name}`);
+        renderPlayback();
+        renderQueue();
+        renderDiscoverySummary();
+        updateTransportButtons();
         return false;
+      }
+
+      if (promotedFrom === 'fresh retry') {
+        log(`Fresh retry ready for ${index + 1}/${playlist.length}: ${target.name}`);
       }
 
       if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();

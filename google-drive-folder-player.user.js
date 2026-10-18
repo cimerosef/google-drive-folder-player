@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Google Drive Folder Player
 // @namespace    https://github.com/cimerosef/google-drive-folder-player
-// @version      0.0.34
+// @version      0.0.35
 // @description  Play a complete Google Drive MP3/WebM folder with direct playback, system media controls, track search/selection, preload, Previous/Pause/Next, Shuffle and Repeat.
 // @author       cimerosef
 // @match        https://drive.google.com/*
@@ -13,7 +13,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.0.34';
+  const VERSION = '0.0.35';
   const PANEL_ID = 'gdfp-probe-panel';
   const MINIMIZED_KEY = 'gdfp-player-minimized';
   const MEDIA_RE = /([^\/\n\r]{1,320}\.(?:mp3|webm))(?=\s|$)/i;
@@ -454,7 +454,9 @@
     if (!slot?.media) return null;
     try {
       slot.media.pause();
+      slot.media.muted = role !== 'current';
       slot.media.currentTime = 0;
+      slot.media.pause();
     } catch {}
     slot.role = role;
     slot.ready = slot.media.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
@@ -476,6 +478,7 @@
   function createSlot(item, index, role) {
     const media = createMedia(item);
     const slot = { media, item: { ...item }, index, role, ready: false, failed: false };
+    media.muted = role !== 'current';
 
     media.addEventListener('loadedmetadata', () => {
       log(`${slot.role} ${labelOf(item)} metadata: ${index + 1}/${playlist.length} · ${Math.round(media.duration || 0)}s.`);
@@ -493,17 +496,25 @@
     });
     media.addEventListener('waiting', () => log(`${slot.role} ${labelOf(item)} waiting: ${item.name}.`));
     media.addEventListener('playing', () => {
-      if (slot === directCurrent && transitionRequestedAt) {
+      if (slot !== directCurrent) {
+        try {
+          media.muted = true;
+          media.pause();
+        } catch {}
+        log(`Blocked unexpected playback from inactive ${slot.role} slot: ${index + 1}/${playlist.length} · ${item.name}`);
+        return;
+      }
+
+      media.muted = false;
+      if (transitionRequestedAt) {
         log(`Audible-start latency: ${Math.round(performance.now() - transitionRequestedAt)} ms.`);
         transitionRequestedAt = 0;
       }
-      if (slot === directCurrent) {
-        autoMode = true;
-        syncMediaSessionMetadata(slot.item);
-        syncMediaSessionPlaybackState();
-        updateTransportButtons();
-        renderDiscoverySummary();
-      }
+      autoMode = true;
+      syncMediaSessionMetadata(slot.item);
+      syncMediaSessionPlaybackState();
+      updateTransportButtons();
+      renderDiscoverySummary();
     });
     media.addEventListener('pause', () => {
       if (slot === directCurrent && !media.ended) {
@@ -586,6 +597,10 @@
         slot = directNext;
         directNext = null;
         slot.role = 'current';
+        try {
+          slot.media.pause();
+          slot.media.muted = false;
+        } catch {}
         promoted = true;
         promotedFrom = 'preload';
         log(`Promoting preloaded ${index + 1}/${playlist.length}.`);
@@ -634,7 +649,13 @@
         log(`Fresh retry ready for ${index + 1}/${playlist.length}: ${target.name}`);
       }
 
-      if (oldCurrent && oldCurrent !== slot) oldCurrent.media.pause();
+      if (oldCurrent && oldCurrent !== slot) {
+        try {
+          oldCurrent.media.muted = true;
+          oldCurrent.media.pause();
+        } catch {}
+      }
+      try { slot.media.muted = false; } catch {}
       setupMediaSession();
       syncMediaSessionMetadata(target);
       transitionRequestedAt = performance.now();
@@ -670,6 +691,18 @@
       setStatus(`Playing ${index + 1}/${playlist.length}${sourceNote}: ${target.name}`);
       log(`Playing ${index + 1}/${playlist.length} via direct media (${reason})${promotedFrom ? ` from ${promotedFrom}` : ''}.`);
       prepareNext();
+      if (directPrevious?.media) {
+        try {
+          directPrevious.media.muted = true;
+          directPrevious.media.pause();
+        } catch {}
+      }
+      if (directNext?.media) {
+        try {
+          directNext.media.muted = true;
+          directNext.media.pause();
+        } catch {}
+      }
       renderPlayback();
       renderQueue();
       renderDiscoverySummary();
